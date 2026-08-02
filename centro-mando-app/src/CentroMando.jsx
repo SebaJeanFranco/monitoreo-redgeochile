@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
-import { AlertTriangle, RefreshCw, ExternalLink, X, Radio, Waves, Map as MapIcon } from "lucide-react";
+import { AlertTriangle, RefreshCw, ExternalLink, X, Radio, Waves, Map as MapIcon, FileText, Copy, Check } from "lucide-react";
 import StationsMap from "./StationsMap.jsx";
 import StationMiniMap from "./StationMiniMap.jsx";
 
@@ -130,6 +130,76 @@ function groupByRegion(stations) {
     if (a.Azul !== b.Azul) return b.Azul - a.Azul;
     return a.region.localeCompare(b.region);
   });
+}
+
+// Emoji de severidad para el informe de texto — mismo criterio de color
+// que el resto del dashboard, en formato que se pueda pegar directo en
+// Instagram/WhatsApp/lo que sea (no HTML, no Markdown — texto plano con
+// emojis, como el ejemplo que armaron a mano).
+const EMOJI_ALERTA = { Roja: "🔴", Amarilla: "🟡", Azul: "🔵" };
+
+// Arma el texto del informe: agrupado por región (pin 📍), con las
+// estaciones de cada región ordenadas por urgencia (Roja primero), y
+// dentro de cada una el mismo texto descriptivo que el ejemplo armado a
+// mano: "Superó el umbral X con un nivel de aguas de Y m, lo que equivale
+// a Z% sobre el umbral." — calculado con la misma fórmula que ya usa
+// StationCard (`exceso`), para que el número siempre coincida con lo que
+// se ve en las tarjetas.
+// Nombre del umbral en masculino para que la frase concuerde ("el umbral
+// rojo", no "el umbral roja") — tipoAlerta se usa en femenino en el resto
+// del dashboard ("Alerta Roja") pero acá la palabra que acompaña es
+// "umbral", que es masculino.
+const UMBRAL_MASCULINO = { Roja: "rojo", Amarilla: "amarillo", Azul: "azul" };
+
+function generarInformeTexto(stations, generadoEn) {
+  const porRegion = new Map();
+  for (const s of stations) {
+    const key = s.regionNombreAprox || "Región no identificada";
+    if (!porRegion.has(key)) porRegion.set(key, []);
+    porRegion.get(key).push(s);
+  }
+
+  // Mismo orden de regiones que el panorama general: la que tenga más
+  // urgencia primero — se reusa groupByRegion solo para el orden, no para
+  // los conteos (que acá no hacen falta).
+  const ordenRegiones = groupByRegion(stations).map(r => r.region);
+
+  // Zona horaria forzada a Chile continental — así el informe queda igual
+  // sin importar en qué huso horario esté configurado el navegador de
+  // quien lo genera (relevante porque esto puede compartirse tal cual,
+  // y la hora debe reflejar la hora chilena real del dato, no la local
+  // de quien lo generó).
+  const fecha = generadoEn ? new Date(generadoEn) : new Date();
+  const fechaTexto = fecha.toLocaleString("es-CL", {
+    timeZone: "America/Santiago",
+    day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
+  });
+
+  const lineas = [
+    `⚠️ Estado de estaciones hidrométricas que han superado los umbrales de alerta de la DGA (${fechaTexto} h), en ríos o esteros en situación de crecida o desborde:`,
+    "",
+  ];
+
+  for (const region of ordenRegiones) {
+    const estaciones = sortByUrgency(porRegion.get(region) || []);
+    if (estaciones.length === 0) continue;
+
+    lineas.push(`📍 ${region}`, "");
+    for (const s of estaciones) {
+      const exceso = s.umbral ? Math.round(((s.valorMedicion - s.umbral) / s.umbral) * 100) : null;
+      const emoji = EMOJI_ALERTA[s.tipoAlerta] || "⚪";
+      const excesoTexto = exceso != null ? `${exceso >= 0 ? "" : "-"}${Math.abs(exceso)}%` : "s/d";
+      const colorUmbral = UMBRAL_MASCULINO[s.tipoAlerta] || (s.tipoAlerta || "").toLowerCase();
+      lineas.push(
+        `${emoji} ${s.nombre}: Superó el umbral ${colorUmbral} con un nivel de aguas de ${s.valorMedicion} ${s.unidad || "m"}, lo que equivale a ${excesoTexto} sobre el umbral.`
+      );
+    }
+    lineas.push("");
+  }
+
+  lineas.push("Fuente: Dirección General de Aguas (DGA) — Sistema Nacional de Información del Agua (SNIA).");
+
+  return lineas.join("\n");
 }
 
 // URL del Worker de Cloudflare que hace de intermediario con la DGA (ver
@@ -301,6 +371,42 @@ export default function CentroMando() {
   // datos (`corridas`) son los mismos que ya tiene resumenNacional, no se
   // vuelven a pedir.
   const [tendenciaExpandida, setTendenciaExpandida] = useState(false);
+
+  // Generador de informe de texto (agrupado por región, listo para
+  // copiar/pegar) — se arma en el momento con los datos ya cargados en
+  // `data.estaciones`, sin pedir nada nuevo al Worker ni a la DGA. El
+  // "generando" es deliberadamente artificial (ver generarInforme más
+  // abajo): la construcción del texto es instantánea, pero se simula una
+  // pausa breve con el overlay de bloqueo para que quede claro que la
+  // acción se registró — evita que alguien pinche el botón varias veces
+  // pensando que no funcionó.
+  const [informeTexto, setInformeTexto] = useState(null);
+  const [generandoInforme, setGenerandoInforme] = useState(false);
+  const [informeCopiado, setInformeCopiado] = useState(false);
+
+  function generarInforme() {
+    setGenerandoInforme(true);
+    setInformeCopiado(false);
+    setTimeout(() => {
+      const texto = generarInformeTexto(sorted, data?.generadoEn);
+      setInformeTexto(texto);
+      setGenerandoInforme(false);
+    }, 600);
+  }
+
+  async function copiarInforme() {
+    if (!informeTexto) return;
+    try {
+      await navigator.clipboard.writeText(informeTexto);
+      setInformeCopiado(true);
+      setTimeout(() => setInformeCopiado(false), 2500);
+    } catch (e) {
+      // Si el navegador bloquea el acceso al portapapeles (permisos,
+      // contexto no seguro, etc.), no hay mucho más que hacer del lado
+      // del cliente — el texto sigue visible en pantalla para seleccionar
+      // y copiar a mano como respaldo.
+    }
+  }
 
   async function refresh() {
     setLoading(true);
@@ -556,7 +662,15 @@ export default function CentroMando() {
               </p>
             </div>
 
-            <div className="flex-1 flex justify-end">
+            <div className="flex-1 flex justify-end gap-2.5">
+              <button
+                onClick={generarInforme}
+                disabled={loading || sorted.length === 0}
+                className="flex items-center gap-2 px-4 py-2.5 rounded-md border border-[#2A4038] text-[#DCE7E3] hover:text-white hover:border-[#3B8FA3]/60 text-[14px] font-semibold transition-colors disabled:opacity-50"
+              >
+                <FileText className="w-4 h-4" />
+                Generar informe
+              </button>
               <button
                 onClick={refresh}
                 disabled={loading}
@@ -732,6 +846,32 @@ export default function CentroMando() {
         <TendenciaNacionalDialog
           corridas={resumenNacional?.corridas}
           onClose={() => setTendenciaExpandida(false)}
+        />
+      )}
+
+      {/* Bloqueo de pantalla completa mientras se arma el informe — la
+          construcción del texto es instantánea, pero el overlay confirma
+          visualmente que el click se registró (evita doble click pensando
+          que no pasó nada). No se puede cerrar ni interactuar con nada
+          detrás mientras está activo. */}
+      {generandoInforme && (
+        <div
+          className="fixed inset-0 flex flex-col items-center justify-center gap-4 bg-black/85 backdrop-blur-sm"
+          style={{ zIndex: 10001 }}
+          role="alert"
+          aria-live="assertive"
+        >
+          <RefreshCw className="w-8 h-8 text-[#7ECBDE] animate-spin" />
+          <p className="font-display font-semibold text-xl text-white">Generando informe, un momento por favor...</p>
+        </div>
+      )}
+
+      {informeTexto && !generandoInforme && (
+        <InformeDialog
+          texto={informeTexto}
+          copiado={informeCopiado}
+          onCopiar={copiarInforme}
+          onClose={() => setInformeTexto(null)}
         />
       )}
       </>
@@ -1683,6 +1823,74 @@ function TendenciaNacionalDialog({ corridas, onClose }) {
               <TendenciaSVG enVentana={enVentana} seriesVisibles={seriesVisibles} height={340} maxEtiquetas={8} puntoRadio={3} />
             </>
           )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Diálogo de informe de texto ----------
+// Muestra el texto armado por generarInformeTexto(), listo para copiar y
+// pegar donde haga falta (Instagram, WhatsApp, etc.). El texto se
+// selecciona completo con un click en el área (además del botón Copiar),
+// para cubrir navegadores donde el acceso al portapapeles esté bloqueado.
+function InformeDialog({ texto, copiado, onCopiar, onClose }) {
+  useEffect(() => {
+    function onKey(e) { if (e.key === "Escape") onClose(); }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  function seleccionarTodo(e) {
+    const range = document.createRange();
+    range.selectNodeContents(e.currentTarget);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+
+  return (
+    <div
+      className="fixed inset-0 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm"
+      style={{ zIndex: 10000 }}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Informe generado"
+      onClick={onClose}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-xl border border-[#1E332C] bg-[#0F1B18] shadow-2xl"
+      >
+        <div className="flex items-start justify-between gap-4 px-8 py-6 border-b border-[#1E332C]">
+          <div>
+            <h2 className="font-display font-bold text-2xl text-white leading-tight">Informe generado</h2>
+            <p className="text-[13px] font-medium text-[#C7D3CE] mt-1">Copiá el texto y pegalo donde lo necesites</p>
+          </div>
+          <button onClick={onClose} className="p-2 rounded-md text-[#9BAEA8] hover:text-[#EDF2F0] hover:bg-[#1E332C] transition-colors flex-shrink-0">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="px-8 py-6">
+          <button
+            onClick={onCopiar}
+            className={`w-full flex items-center justify-center gap-2 mb-4 px-4 py-3 rounded-lg border font-mono text-[13px] font-bold transition-colors ${
+              copiado
+                ? "border-[#3B8FA3]/50 bg-[#3B8FA3]/10 text-[#7ECBDE]"
+                : "border-[#2A4038] text-[#DCE7E3] hover:text-white hover:border-[#3B8FA3]/60"
+            }`}
+          >
+            {copiado ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+            {copiado ? "¡Copiado!" : "Copiar al portapapeles"}
+          </button>
+
+          <pre
+            onClick={seleccionarTodo}
+            className="whitespace-pre-wrap font-mono text-[13px] text-[#C7D3CE] leading-relaxed rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-4 cursor-text select-all"
+          >
+            {texto}
+          </pre>
         </div>
       </div>
     </div>
