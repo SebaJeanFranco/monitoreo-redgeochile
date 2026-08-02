@@ -1110,14 +1110,14 @@ function StationDialog({ station, estacionesCategoria, onClose, onOpenStation, o
     >
       <div
         onClick={e => e.stopPropagation()}
-        className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-xl border border-[#1E332C] bg-[#0F1B18] shadow-2xl"
+        className="w-full max-w-5xl max-h-[92vh] overflow-y-auto rounded-xl border border-[#1E332C] bg-[#0F1B18] shadow-2xl"
       >
         <div className={`flex items-start justify-between gap-4 px-8 py-6 border-b border-[#1E332C] ${s.bg}`}>
           <div>
             <span className={`font-mono text-[11px] font-bold px-1.5 py-0.5 rounded border ${s.chip} tracking-wide`}>
               {s.label}
             </span>
-            <h2 className="font-display font-bold text-xl text-white mt-2 leading-tight">{station.nombre}</h2>
+            <h2 className="font-display font-bold text-2xl text-white mt-2 leading-tight">{station.nombre}</h2>
             <p className="text-[14px] font-medium text-[#C7D3CE] mt-1">{station.regionNombreAprox}</p>
           </div>
           <button onClick={onClose} className="p-2 rounded-md text-[#9BAEA8] hover:text-[#EDF2F0] hover:bg-[#1E332C] transition-colors flex-shrink-0">
@@ -1125,157 +1125,164 @@ function StationDialog({ station, estacionesCategoria, onClose, onOpenStation, o
           </button>
         </div>
 
-        <div className="px-8 py-6">
-          {/* Medición principal */}
-          <div className="rounded-lg bg-[#0A1210] border border-[#1E332C] px-5 py-4 mb-4">
-            <div className="flex items-center justify-between mb-3">
-              <span className="text-xs text-[#C7D3CE] uppercase tracking-wide">{station.parametro || "Medición"}</span>
-              {station.fecha && (
-                <span
-                  className="font-mono text-[11px] text-[#7C8F88]"
-                  title="Hora de generación del mapa de la DGA (todas las estaciones comparten esta misma hora) — no es la hora exacta en que se midió este río."
-                >
-                  Mapa DGA: {station.fecha}
-                </span>
-              )}
-            </div>
-            <div className="flex items-end justify-between">
-              <p className={`font-mono text-4xl font-bold ${s.text}`}>
-                {station.valorMedicion}<span className="text-base font-normal text-[#9BAEA8] ml-1">{station.unidad}</span>
-              </p>
-              <div className="text-right">
-                <p className="text-[11px] text-[#7C8F88] uppercase tracking-wide mb-1">Umbral DGA</p>
-                <p className="font-mono text-lg text-[#C7D3CE]">
-                  {station.umbral}<span className="text-xs font-normal text-[#9BAEA8] ml-1">{station.unidad}</span>
-                </p>
-              </div>
-            </div>
-            {station.tendencia && <TendenciaTag tendencia={station.tendencia} />}
-          </div>
-
-          {/* Evolución del Nivel de Agua — gráfico de línea contra el
-              umbral de alerta, usando el histórico guardado en Sheets por
-              el cron (una lectura cada 30 min). Vive acá, justo debajo de
-              la medición principal, porque es la misma magnitud graficada
-              en el tiempo. */}
-          <div className="mb-4">
-            <p className="text-[11px] text-[#7C8F88] uppercase tracking-wide mb-1.5">Evolución reciente</p>
-            <HistoricoChart
-              puntos={historico?.puntos}
-              loading={historicoLoading}
-              error={historicoError}
-              umbral={station.umbral}
-              unidad={station.unidad}
-              colorClass={s.text}
-            />
-          </div>
-
-          {/* Ubicación exacta de la estación */}
-          <div className="mb-4">
-            <p className="text-[11px] text-[#7C8F88] uppercase tracking-wide mb-1.5">Ubicación</p>
-            <StationMiniMap station={station} />
-          </div>
-
-          {/* Caudal / Precipitación / Nieve / Volumen — solo si el JSON se generó con --detalle */}
-          {d && hayAlgunDetalle && (
-            <div className="grid grid-cols-2 gap-2.5 mb-4">
-              {d.caudalM3s != null && <Stat label="Caudal" value={d.caudalM3s} unit="m³/seg" />}
-              {d.precipitacion24hMm != null && <Stat label="Pptación últimas 24h" value={d.precipitacion24hMm} unit="mm" />}
-              {d.precipitacionAcumMm != null && <Stat label="Pptación acumulada" value={d.precipitacionAcumMm} unit="mm" />}
-              {d.alturaNieveCm != null && <Stat label="Altura de nieve" value={d.alturaNieveCm} unit="cm" />}
-              {d.volumenLagoMillM3 != null && <Stat label="Volumen de lago" value={d.volumenLagoMillM3} unit="Mill.m³" />}
-            </div>
-          )}
-          {(!d || !hayAlgunDetalle) && (
-            <div className="mb-4">
-              {station.tipoAlerta === "Azul" ? (
-                <div className="flex items-start gap-2 rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-3">
-                  <Radio className="w-3.5 h-3.5 text-[#7C8F88] flex-shrink-0 mt-0.5" />
-                  <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
-                    Esta estación está en alerta Azul — el Caudal solo se calcula para alertas Roja y Amarilla, para mantener la carga rápida.
-                  </p>
-                </div>
-              ) : d ? (
-                <div className="flex items-start gap-2 rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-3">
-                  <Radio className="w-3.5 h-3.5 text-[#7C8F88] flex-shrink-0 mt-0.5" />
-                  <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
-                    La DGA consultó esta estación pero no reportó Caudal ni Precipitación — es posible que no tenga esos sensores instalados.
-                  </p>
-                </div>
-              ) : !WORKER_URL ? (
-                <div className="flex items-start gap-2 rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-3">
-                  <Radio className="w-3.5 h-3.5 text-[#7C8F88] flex-shrink-0 mt-0.5" />
-                  <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
-                    Sin datos de Caudal/Precipitación — corré el script con <code className="text-[#7ECBDE] font-mono">--detalle</code> para incluirlos, o configurá <code className="text-[#7ECBDE] font-mono">VITE_DGA_WORKER_URL</code> para pedirlo bajo demanda.
-                  </p>
-                </div>
-              ) : station.caudalEstado?.loading ? (
-                <div className="w-full flex items-center justify-center gap-2 font-mono text-[12px] font-semibold text-[#9BAEA8] border border-white/10 rounded-lg py-3">
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  Consultando Caudal en la DGA...
-                </div>
-              ) : (
-                <>
-                  {station.caudalEstado?.error && (
-                    <p className="text-[11px] text-[#9BAEA8] mb-2">No se pudo obtener: {station.caudalEstado.error}</p>
-                  )}
-                  <button
-                    onClick={() => onObtenerCaudal(station)}
-                    disabled={!onObtenerCaudal || !WORKER_URL}
-                    className={`w-full text-center font-mono text-[13px] font-bold rounded-lg border py-3 transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${s.borderSoft} ${s.text} hover:bg-white/[0.04]`}
+        {/* Layout de 2 columnas en pantallas anchas: izquierda concentra la
+            medición viva (número actual, evolución, Caudal/detalle);
+            derecha concentra el contexto espacial y técnico (mapa, ficha,
+            sugerencia, link oficial). En mobile (una columna) el orden
+            natural del DOM ya prioriza lo más importante primero. */}
+        <div className="px-8 py-6 grid grid-cols-1 lg:grid-cols-2 gap-x-6">
+          <div>
+            {/* Medición principal */}
+            <div className="rounded-lg bg-[#0A1210] border border-[#1E332C] px-5 py-4 mb-4">
+              <div className="flex items-center justify-between mb-3">
+                <span className="text-xs text-[#C7D3CE] uppercase tracking-wide">{station.parametro || "Medición"}</span>
+                {station.fecha && (
+                  <span
+                    className="font-mono text-[11px] text-[#7C8F88]"
+                    title="Hora de generación del mapa de la DGA (todas las estaciones comparten esta misma hora) — no es la hora exacta en que se midió este río."
                   >
-                    Obtener Caudal
-                  </button>
-                </>
-              )}
-            </div>
-          )}
-
-          {/* Estación con Caudal más cercana — se muestra solo cuando ESTA
-              estación sí fue consultada por la DGA pero no reportó Caudal
-              (no aplica al caso "nunca se pidió detalle", donde tampoco
-              tiene sentido sugerir nada todavía). */}
-          {sugerenciaCercana && (
-            <button
-              onClick={() => onOpenStation(sugerenciaCercana.estacion)}
-              className="w-full text-left flex flex-col gap-1.5 rounded-lg bg-[#3B8FA3]/[0.08] border border-[#3B8FA3]/30 px-4 py-3 mb-4 hover:border-[#3B8FA3]/60 transition-colors"
-            >
-              <p className="text-[10px] font-bold uppercase tracking-widest text-[#7ECBDE]">Sugerencia cercana</p>
-              <p className="text-[12px] text-[#C7D3CE] leading-relaxed">
-                La DGA no tiene Caudal para esta estación en este momento, pero a{" "}
-                <span className="font-mono font-semibold text-[#EDF2F0]">{sugerenciaCercana.distanciaKm.toFixed(1)} km</span>{" "}
-                está <span className="font-semibold text-[#EDF2F0]">{sugerenciaCercana.estacion.nombre}</span> con{" "}
-                <span className="font-mono font-semibold text-[#7ECBDE]">{sugerenciaCercana.estacion.detalle.caudalM3s} m³/seg</span>.
-              </p>
-              <span className="text-[11px] font-mono font-semibold text-[#7ECBDE] flex items-center gap-1">
-                Ver ficha de {sugerenciaCercana.estacion.nombre} <ExternalLink className="w-3 h-3" />
-              </span>
-            </button>
-          )}
-
-          {/* Ficha técnica */}
-          <div className="space-y-2 mb-5">
-            {facts.map(f => (
-              <div key={f.label} className="flex items-center justify-between text-[13px] border-b border-[#1A2C26] pb-2">
-                <span className="text-[#C7D3CE]">{f.label}</span>
-                <span className="text-[#C7D3CE] font-mono text-right">{f.value}</span>
+                    Mapa DGA: {station.fecha}
+                  </span>
+                )}
               </div>
-            ))}
+              <div className="flex items-end justify-between">
+                <p className={`font-mono text-4xl font-bold ${s.text}`}>
+                  {station.valorMedicion}<span className="text-base font-normal text-[#9BAEA8] ml-1">{station.unidad}</span>
+                </p>
+                <div className="text-right">
+                  <p className="text-[11px] text-[#7C8F88] uppercase tracking-wide mb-1">Umbral DGA</p>
+                  <p className="font-mono text-lg text-[#C7D3CE]">
+                    {station.umbral}<span className="text-xs font-normal text-[#9BAEA8] ml-1">{station.unidad}</span>
+                  </p>
+                </div>
+              </div>
+              {station.tendencia && <TendenciaTag tendencia={station.tendencia} />}
+            </div>
+
+            {/* Evolución del Nivel de Agua — gráfico de línea contra el
+                umbral de alerta, usando el histórico guardado en Sheets por
+                el cron (una lectura cada 30 min). */}
+            <div className="mb-4">
+              <p className="text-[11px] text-[#7C8F88] uppercase tracking-wide mb-1.5">Evolución reciente</p>
+              <HistoricoChart
+                puntos={historico?.puntos}
+                loading={historicoLoading}
+                error={historicoError}
+                umbral={station.umbral}
+                unidad={station.unidad}
+                colorClass={s.text}
+              />
+            </div>
+
+            {/* Caudal / Precipitación / Nieve / Volumen — solo si el JSON se generó con --detalle */}
+            {d && hayAlgunDetalle && (
+              <div className="grid grid-cols-2 gap-2.5 mb-4">
+                {d.caudalM3s != null && <Stat label="Caudal" value={d.caudalM3s} unit="m³/seg" />}
+                {d.precipitacion24hMm != null && <Stat label="Pptación últimas 24h" value={d.precipitacion24hMm} unit="mm" />}
+                {d.precipitacionAcumMm != null && <Stat label="Pptación acumulada" value={d.precipitacionAcumMm} unit="mm" />}
+                {d.alturaNieveCm != null && <Stat label="Altura de nieve" value={d.alturaNieveCm} unit="cm" />}
+                {d.volumenLagoMillM3 != null && <Stat label="Volumen de lago" value={d.volumenLagoMillM3} unit="Mill.m³" />}
+              </div>
+            )}
+            {(!d || !hayAlgunDetalle) && (
+              <div className="mb-4">
+                {station.tipoAlerta === "Azul" ? (
+                  <div className="flex items-start gap-2 rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-3">
+                    <Radio className="w-3.5 h-3.5 text-[#7C8F88] flex-shrink-0 mt-0.5" />
+                    <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
+                      Esta estación está en alerta Azul — el Caudal solo se calcula para alertas Roja y Amarilla, para mantener la carga rápida.
+                    </p>
+                  </div>
+                ) : d ? (
+                  <div className="flex items-start gap-2 rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-3">
+                    <Radio className="w-3.5 h-3.5 text-[#7C8F88] flex-shrink-0 mt-0.5" />
+                    <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
+                      La DGA consultó esta estación pero no reportó Caudal ni Precipitación — es posible que no tenga esos sensores instalados.
+                    </p>
+                  </div>
+                ) : !WORKER_URL ? (
+                  <div className="flex items-start gap-2 rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-3">
+                    <Radio className="w-3.5 h-3.5 text-[#7C8F88] flex-shrink-0 mt-0.5" />
+                    <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
+                      Sin datos de Caudal/Precipitación — corré el script con <code className="text-[#7ECBDE] font-mono">--detalle</code> para incluirlos, o configurá <code className="text-[#7ECBDE] font-mono">VITE_DGA_WORKER_URL</code> para pedirlo bajo demanda.
+                    </p>
+                  </div>
+                ) : station.caudalEstado?.loading ? (
+                  <div className="w-full flex items-center justify-center gap-2 font-mono text-[12px] font-semibold text-[#9BAEA8] border border-white/10 rounded-lg py-3">
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    Consultando Caudal en la DGA...
+                  </div>
+                ) : (
+                  <>
+                    {station.caudalEstado?.error && (
+                      <p className="text-[11px] text-[#9BAEA8] mb-2">No se pudo obtener: {station.caudalEstado.error}</p>
+                    )}
+                    <button
+                      onClick={() => onObtenerCaudal(station)}
+                      disabled={!onObtenerCaudal || !WORKER_URL}
+                      className={`w-full text-center font-mono text-[13px] font-bold rounded-lg border py-3 transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${s.borderSoft} ${s.text} hover:bg-white/[0.04]`}
+                    >
+                      Obtener Caudal
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* Estación con Caudal más cercana — se muestra solo cuando ESTA
+                estación sí fue consultada por la DGA pero no reportó Caudal
+                (no aplica al caso "nunca se pidió detalle", donde tampoco
+                tiene sentido sugerir nada todavía). */}
+            {sugerenciaCercana && (
+              <button
+                onClick={() => onOpenStation(sugerenciaCercana.estacion)}
+                className="w-full text-left flex flex-col gap-1.5 rounded-lg bg-[#3B8FA3]/[0.08] border border-[#3B8FA3]/30 px-4 py-3 mb-4 hover:border-[#3B8FA3]/60 transition-colors"
+              >
+                <p className="text-[10px] font-bold uppercase tracking-widest text-[#7ECBDE]">Sugerencia cercana</p>
+                <p className="text-[12px] text-[#C7D3CE] leading-relaxed">
+                  La DGA no tiene Caudal para esta estación en este momento, pero a{" "}
+                  <span className="font-mono font-semibold text-[#EDF2F0]">{sugerenciaCercana.distanciaKm.toFixed(1)} km</span>{" "}
+                  está <span className="font-semibold text-[#EDF2F0]">{sugerenciaCercana.estacion.nombre}</span> con{" "}
+                  <span className="font-mono font-semibold text-[#7ECBDE]">{sugerenciaCercana.estacion.detalle.caudalM3s} m³/seg</span>.
+                </p>
+                <span className="text-[11px] font-mono font-semibold text-[#7ECBDE] flex items-center gap-1">
+                  Ver ficha de {sugerenciaCercana.estacion.nombre} <ExternalLink className="w-3 h-3" />
+                </span>
+              </button>
+            )}
           </div>
 
-          <a
-            href={SNIA_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center justify-between gap-2 px-4 py-3 rounded-lg bg-[#0A1210] border border-[#1E332C] hover:border-[#3B8FA3]/40 text-sm text-[#C7D3CE] hover:text-[#EDF2F0] transition-colors"
-          >
-            Ver gráfico histórico en el visor oficial de la DGA
-            <ExternalLink className="w-4 h-4 flex-shrink-0 text-[#7C8F88]" />
-          </a>
+          <div>
+            {/* Ubicación exacta de la estación */}
+            <div className="mb-4">
+              <p className="text-[11px] text-[#7C8F88] uppercase tracking-wide mb-1.5">Ubicación</p>
+              <StationMiniMap station={station} />
+            </div>
 
-          <p className="text-[11px] text-[#7C8F88] font-mono mt-4 pt-4 border-t border-[#1E332C] leading-relaxed">
-            Fuente: Dirección General de Aguas (DGA) — Sistema Nacional de Información del Agua (SNIA). Dato de estación física real, no modelo. La hora "Mapa DGA" es cuándo la DGA generó su mapa (igual para todas las estaciones), no la hora exacta de esta medición — la DGA no publica esa hora por estación.
-          </p>
+            {/* Ficha técnica */}
+            <div className="space-y-2 mb-5">
+              {facts.map(f => (
+                <div key={f.label} className="flex items-center justify-between text-[13px] border-b border-[#1A2C26] pb-2">
+                  <span className="text-[#C7D3CE]">{f.label}</span>
+                  <span className="text-[#C7D3CE] font-mono text-right">{f.value}</span>
+                </div>
+              ))}
+            </div>
+
+            <a
+              href={SNIA_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center justify-between gap-2 px-4 py-3 rounded-lg bg-[#0A1210] border border-[#1E332C] hover:border-[#3B8FA3]/40 text-sm text-[#C7D3CE] hover:text-[#EDF2F0] transition-colors"
+            >
+              Ver gráfico histórico en el visor oficial de la DGA
+              <ExternalLink className="w-4 h-4 flex-shrink-0 text-[#7C8F88]" />
+            </a>
+
+            <p className="text-[11px] text-[#7C8F88] font-mono mt-4 pt-4 border-t border-[#1E332C] leading-relaxed">
+              Fuente: Dirección General de Aguas (DGA) — Sistema Nacional de Información del Agua (SNIA). Dato de estación física real, no modelo. La hora "Mapa DGA" es cuándo la DGA generó su mapa (igual para todas las estaciones), no la hora exacta de esta medición — la DGA no publica esa hora por estación.
+            </p>
+          </div>
         </div>
       </div>
     </div>
@@ -1414,6 +1421,24 @@ function Stat({ label, value, unit }) {
 const HORAS_VENTANA_TENDENCIA = 6;
 
 function TendenciaNacionalChart({ corridas, error }) {
+  // Qué series están visibles ahora mismo — por defecto las 4 (Total +
+  // los 3 colores). Clickeando un chip de la leyenda se prende/apaga esa
+  // serie puntual, así el usuario puede aislar, por ejemplo, solo Roja
+  // para ver su evolución sin que Azul (normalmente el número más alto)
+  // aplaste la escala del gráfico.
+  const [seriesActivas, setSeriesActivas] = useState({ Total: true, Roja: true, Amarilla: true, Azul: true });
+
+  function toggleSerie(key) {
+    setSeriesActivas(prev => {
+      const next = { ...prev, [key]: !prev[key] };
+      // No permitir apagar todas — si el usuario intenta apagar la última
+      // serie visible, el click no tiene efecto (evita un gráfico vacío
+      // sin ninguna pista de qué pasó).
+      const quedanActivas = Object.values(next).some(Boolean);
+      return quedanActivas ? next : prev;
+    });
+  }
+
   if (error) {
     return (
       <div className="rounded-lg bg-[#0F1B18] border border-[#1E332C] px-4 py-3">
@@ -1441,7 +1466,7 @@ function TendenciaNacionalChart({ corridas, error }) {
   const variacionTotal = ultimo.total - primero.total;
 
   // Layout del SVG — igual criterio que HistoricoChart.
-  const W = 600, H = 130, padL = 28, padR = 12, padT = 10, padB = 20;
+  const W = 600, H = 140, padL = 28, padR = 12, padT = 10, padB = 26;
   const plotW = W - padL - padR;
   const plotH = H - padT - padB;
 
@@ -1450,12 +1475,18 @@ function TendenciaNacionalChart({ corridas, error }) {
   const tMax = Math.max(...times);
   const tRango = Math.max(tMax - tMin, 1);
 
-  const series = [
-    { key: "Roja", color: "#FF8B6B" },
-    { key: "Amarilla", color: "#F5C876" },
-    { key: "Azul", color: "#7ECBDE" },
+  const TODAS_LAS_SERIES = [
+    { key: "Total", color: "#EDF2F0", get: c => c.total },
+    { key: "Roja", color: "#FF8B6B", get: c => c.Roja || 0 },
+    { key: "Amarilla", color: "#F5C876", get: c => c.Amarilla || 0 },
+    { key: "Azul", color: "#7ECBDE", get: c => c.Azul || 0 },
   ];
-  const maxY = Math.max(1, ...enVentana.flatMap(c => series.map(s => c[s.key] || 0)));
+  const seriesVisibles = TODAS_LAS_SERIES.filter(s => seriesActivas[s.key]);
+
+  // El eje Y se reescala según lo que esté visible — así aislar una sola
+  // serie (ej. solo Roja) la muestra usando todo el alto disponible, en
+  // vez de quedar aplastada contra el piso por la escala de Total/Azul.
+  const maxY = Math.max(1, ...enVentana.flatMap(c => seriesVisibles.map(s => s.get(c))));
 
   function x(i) { return padL + (plotW * (times[i] - tMin)) / tRango; }
   function y(v) { return padT + plotH - (plotH * v) / maxY; }
@@ -1480,33 +1511,77 @@ function TendenciaNacionalChart({ corridas, error }) {
         )}
       </div>
 
-      {/* Mini gráfico de 3 líneas — desglose por color */}
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" preserveAspectRatio="none" style={{ height: 130 }}>
+      {/* Chips de filtro — clickeables, prenden/apagan cada serie */}
+      <div className="flex items-center gap-2 mb-3 flex-wrap">
+        {TODAS_LAS_SERIES.map(s => {
+          const activa = seriesActivas[s.key];
+          return (
+            <button
+              key={s.key}
+              onClick={() => toggleSerie(s.key)}
+              className="flex items-center gap-1.5 font-mono text-[10px] font-semibold px-2 py-1 rounded-md border transition-colors"
+              style={{
+                color: activa ? s.color : "#5C726A",
+                borderColor: activa ? `${s.color}66` : "#1E332C",
+                backgroundColor: activa ? `${s.color}14` : "transparent",
+              }}
+              aria-pressed={activa}
+            >
+              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: activa ? s.color : "#3C5850" }} />
+              {s.key} {s.get(ultimo)}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Mini gráfico — solo las series activas */}
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" preserveAspectRatio="none" style={{ height: 140 }}>
         {[0, maxY / 2, maxY].map((v, i) => (
           <line key={i} x1={padL} x2={W - padR} y1={y(v)} y2={y(v)} stroke="#1E332C" strokeWidth="1" />
         ))}
-        {series.map(s => {
-          const path = enVentana
-            .map((c, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(c[s.key] || 0).toFixed(1)}`)
-            .join(" ");
-          return <path key={s.key} d={path} fill="none" stroke={s.color} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />;
-        })}
-      </svg>
+        {seriesVisibles.map(s => (
+          <g key={s.key}>
+            <path
+              d={enVentana.map((c, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(s.get(c)).toFixed(1)}`).join(" ")}
+              fill="none"
+              stroke={s.color}
+              strokeWidth="2"
+              strokeLinejoin="round"
+              strokeLinecap="round"
+            />
+            {/* Un punto por corrida — así se ve exactamente cuántas
+                lecturas hay y dónde cae cada una en el tiempo, no solo la
+                tendencia general de la línea. */}
+            {enVentana.map((c, i) => (
+              <circle key={i} cx={x(i)} cy={y(s.get(c))} r="2.5" fill={s.color} />
+            ))}
+          </g>
+        ))}
 
-      {/* Leyenda + rango de tiempo */}
-      <div className="flex items-center justify-between mt-1">
-        <div className="flex items-center gap-3">
-          {series.map(s => (
-            <span key={s.key} className="flex items-center gap-1.5 font-mono text-[10px] font-semibold" style={{ color: s.color }}>
-              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: s.color }} />
-              {s.key} {enVentana[enVentana.length - 1][s.key] || 0}
-            </span>
-          ))}
-        </div>
-        <span className="font-mono text-[10px] text-[#7C8F88]">
-          {fmtHora(primero.timestamp)} – {fmtHora(ultimo.timestamp)}
-        </span>
-      </div>
+        {/* Etiquetas de hora en el eje X — hasta 5, espaciadas parejo
+            entre la primera y la última corrida, para saber a qué hora
+            fue cada tramo sin tener que pasar el mouse por cada punto. */}
+        {(() => {
+          const maxEtiquetas = 5;
+          const paso = Math.max(1, Math.ceil((enVentana.length - 1) / (maxEtiquetas - 1)));
+          const indices = [];
+          for (let i = 0; i < enVentana.length; i += paso) indices.push(i);
+          if (indices[indices.length - 1] !== enVentana.length - 1) indices.push(enVentana.length - 1);
+          return indices.map(i => (
+            <text
+              key={i}
+              x={x(i)}
+              y={H - 4}
+              textAnchor={i === 0 ? "start" : i === enVentana.length - 1 ? "end" : "middle"}
+              fontSize="9"
+              fill="#7C8F88"
+              fontFamily="IBM Plex Mono, monospace"
+            >
+              {new Date(enVentana[i].timestamp).toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })}
+            </text>
+          ));
+        })()}
+      </svg>
     </div>
   );
 }
