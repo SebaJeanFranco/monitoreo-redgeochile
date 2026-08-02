@@ -190,8 +190,15 @@ function generarInformeTexto(stations, generadoEn) {
       const emoji = EMOJI_ALERTA[s.tipoAlerta] || "⚪";
       const excesoTexto = exceso != null ? `${exceso >= 0 ? "" : "-"}${Math.abs(exceso)}%` : "s/d";
       const colorUmbral = UMBRAL_MASCULINO[s.tipoAlerta] || (s.tipoAlerta || "").toLowerCase();
+      // Caudal: solo se agrega si se pidió y la DGA lo reportó — para
+      // Azul nunca se pide (mismo criterio que el resto del dashboard), y
+      // para Roja/Amarilla puede faltar si la DGA no lo tenía disponible
+      // en el momento de la consulta. No se inventa "s/d" para no alargar
+      // cada línea innecesariamente cuando no hay dato.
+      const caudal = s.detalle?.caudalM3s;
+      const caudalTexto = caudal != null ? ` Caudal: ${caudal} m³/seg.` : "";
       lineas.push(
-        `${emoji} ${s.nombre}: Superó el umbral ${colorUmbral} con un nivel de aguas de ${s.valorMedicion} ${s.unidad || "m"}, lo que equivale a ${excesoTexto} sobre el umbral.`
+        `${emoji} ${s.nombre}: Superó el umbral ${colorUmbral} con un nivel de aguas de ${s.valorMedicion} ${s.unidad || "m"}, lo que equivale a ${excesoTexto} sobre el umbral.${caudalTexto}`
       );
     }
     lineas.push("");
@@ -373,25 +380,73 @@ export default function CentroMando() {
   const [tendenciaExpandida, setTendenciaExpandida] = useState(false);
 
   // Generador de informe de texto (agrupado por región, listo para
-  // copiar/pegar) — se arma en el momento con los datos ya cargados en
-  // `data.estaciones`, sin pedir nada nuevo al Worker ni a la DGA. El
-  // "generando" es deliberadamente artificial (ver generarInforme más
-  // abajo): la construcción del texto es instantánea, pero se simula una
-  // pausa breve con el overlay de bloqueo para que quede claro que la
-  // acción se registró — evita que alguien pinche el botón varias veces
-  // pensando que no funcionó.
+  // copiar/pegar). A diferencia de la carga básica del panorama general,
+  // el informe SÍ incluye Caudal — y como el Caudal solo existe pidiéndolo
+  // estación por estación a la DGA (ver /caudal en worker.js, no hay forma
+  // de traerlo en lote), generar el informe dispara una consulta en serie
+  // a todas las estaciones Roja/Amarilla que todavía no lo tengan. Por eso
+  // el botón bloquea toda la pantalla con progreso mientras dura — puede
+  // tardar bastante (varios segundos por estación) según cuántas alertas
+  // haya en el momento.
   const [informeTexto, setInformeTexto] = useState(null);
   const [generandoInforme, setGenerandoInforme] = useState(false);
   const [informeCopiado, setInformeCopiado] = useState(false);
+  const [progresoInforme, setProgresoInforme] = useState({ hechas: 0, total: 0, estimadoSegRestantes: 0 });
 
-  function generarInforme() {
+  // Tiempo promedio real por estación consultada (ver DETALLE_DELAY_MS +
+  // duración de la petición en worker.js) — usado solo para el estimado
+  // de "tiempo restante" que se muestra en pantalla, no afecta el ritmo
+  // real de las peticiones.
+  const SEG_ESTIMADO_POR_ESTACION = 1.3;
+
+  async function generarInforme() {
     setGenerandoInforme(true);
     setInformeCopiado(false);
-    setTimeout(() => {
-      const texto = generarInformeTexto(sorted, data?.generadoEn);
-      setInformeTexto(texto);
-      setGenerandoInforme(false);
-    }, 600);
+
+    // Estaciones que necesitan Caudal para el informe: Roja y Amarilla
+    // únicamente (mismo criterio que el resto del dashboard — Azul nunca
+    // pide Caudal, ver worker.js). Se arma un mapa local código→detalle
+    // que arranca con lo que YA se haya pedido antes desde las tarjetas
+    // (caudalPorEstacion), para no re-consultar de nuevo lo que ya se
+    // tiene.
+    const elegibles = sorted.filter(s => s.tipoAlerta === "Roja" || s.tipoAlerta === "Amarilla");
+    const caudalPorCodigo = new Map();
+    for (const s of elegibles) {
+      const yaTenido = caudalPorEstacion[s.codigo]?.detalle;
+      if (yaTenido) caudalPorCodigo.set(s.codigo, yaTenido);
+    }
+    const faltantes = elegibles.filter(s => !caudalPorCodigo.has(s.codigo));
+
+    setProgresoInforme({ hechas: 0, total: faltantes.length, estimadoSegRestantes: Math.round(faltantes.length * SEG_ESTIMADO_POR_ESTACION) });
+
+    // En serie, no en paralelo — mismo motivo que fetchDetalleEnLotes() en
+    // el Worker: el servidor JSF de la DGA pisa el ViewState cuando llegan
+    // varias peticiones casi simultáneas y devuelve datos vacíos.
+    for (let i = 0; i < faltantes.length; i++) {
+      const s = faltantes[i];
+      try {
+        const json = await loadCaudalEstacion(s.codigo, s.tipoEstacion);
+        if (json?.detalle) caudalPorCodigo.set(s.codigo, json.detalle);
+      } catch (e) {
+        // Una estación que falla no debe frenar el resto del informe —
+        // simplemente queda sin Caudal en el texto final, igual que ya
+        // maneja el resto del dashboard cuando la DGA no responde.
+      }
+      const restantes = faltantes.length - (i + 1);
+      setProgresoInforme({ hechas: i + 1, total: faltantes.length, estimadoSegRestantes: Math.round(restantes * SEG_ESTIMADO_POR_ESTACION) });
+    }
+
+    // Estaciones enriquecidas con el Caudal recién obtenido, para pasarle
+    // al generador de texto — no se pisa `sorted` ni `caudalPorEstacion`
+    // del resto del dashboard, esto es solo para el informe.
+    const stationsConCaudal = sorted.map(s => {
+      const detalle = caudalPorCodigo.get(s.codigo);
+      return detalle ? { ...s, detalle } : s;
+    });
+
+    const texto = generarInformeTexto(stationsConCaudal, data?.generadoEn);
+    setInformeTexto(texto);
+    setGenerandoInforme(false);
   }
 
   async function copiarInforme() {
@@ -665,7 +720,7 @@ export default function CentroMando() {
             <div className="flex-1 flex justify-end gap-2.5">
               <button
                 onClick={generarInforme}
-                disabled={loading || sorted.length === 0}
+                disabled={loading || sorted.length === 0 || generandoInforme}
                 className="flex items-center gap-2 px-4 py-2.5 rounded-md border border-[#2A4038] text-[#DCE7E3] hover:text-white hover:border-[#3B8FA3]/60 text-[14px] font-semibold transition-colors disabled:opacity-50"
               >
                 <FileText className="w-4 h-4" />
@@ -849,20 +904,44 @@ export default function CentroMando() {
         />
       )}
 
-      {/* Bloqueo de pantalla completa mientras se arma el informe — la
-          construcción del texto es instantánea, pero el overlay confirma
-          visualmente que el click se registró (evita doble click pensando
-          que no pasó nada). No se puede cerrar ni interactuar con nada
-          detrás mientras está activo. */}
+      {/* Bloqueo de pantalla completa mientras se arma el informe — pide
+          Caudal en serie a la DGA para cada estación Roja/Amarilla que
+          todavía no lo tenga (ver generarInforme), así que puede tardar
+          bastante según cuántas alertas haya. La barra de progreso y el
+          estimado le dan al usuario una idea de cuánto falta, en vez de
+          solo un spinner indefinido. No se puede cerrar ni interactuar
+          con nada detrás mientras está activo. */}
       {generandoInforme && (
         <div
-          className="fixed inset-0 flex flex-col items-center justify-center gap-4 bg-black/85 backdrop-blur-sm"
+          className="fixed inset-0 flex flex-col items-center justify-center gap-4 bg-black/85 backdrop-blur-sm px-6"
           style={{ zIndex: 10001 }}
           role="alert"
           aria-live="assertive"
         >
           <RefreshCw className="w-8 h-8 text-[#7ECBDE] animate-spin" />
-          <p className="font-display font-semibold text-xl text-white">Generando informe, un momento por favor...</p>
+          <div className="text-center">
+            <p className="font-display font-semibold text-xl text-white">Generando informe, un momento por favor...</p>
+            <p className="font-mono text-[12px] text-[#9BAEA8] mt-2">
+              {progresoInforme.total > 0
+                ? `Consultando Caudal en la DGA: ${progresoInforme.hechas} / ${progresoInforme.total} estaciones`
+                : "Preparando consulta..."}
+            </p>
+          </div>
+          {progresoInforme.total > 0 && (
+            <div className="w-full max-w-sm">
+              <div className="h-1.5 rounded-full bg-[#1E332C] overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-[#3B8FA3] transition-[width] duration-300 ease-linear"
+                  style={{ width: `${Math.min(100, (progresoInforme.hechas / progresoInforme.total) * 100)}%` }}
+                />
+              </div>
+              <p className="font-mono text-[11px] text-[#7C8F88] mt-2 text-center">
+                {progresoInforme.estimadoSegRestantes > 0
+                  ? `Tiempo estimado restante: ~${progresoInforme.estimadoSegRestantes}s`
+                  : "Ya casi..."}
+              </p>
+            </div>
+          )}
         </div>
       )}
 
@@ -1516,7 +1595,7 @@ function HistoricoChart({ puntos, loading, error, umbral, unidad, colorClass }) 
 
   return (
     <div className="rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 pt-4 pb-3">
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" preserveAspectRatio="none" style={{ height: 180 }}>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" preserveAspectRatio="xMidYMid meet" style={{ maxHeight: H }}>
         {/* Grilla horizontal simple: min / medio / max del eje Y */}
         {[yMin, (yMin + yMax) / 2, yMax].map((v, i) => (
           <g key={i}>
@@ -1614,7 +1693,7 @@ function useTendenciaData(corridas, horasVentana) {
 // puedan pedir distinto tamaño y distinta cantidad de etiquetas de hora
 // sin duplicar la lógica de escalas/paths.
 function TendenciaSVG({ enVentana, seriesVisibles, width = 600, height = 140, maxEtiquetas = 5, puntoRadio = 2.5 }) {
-  const W = width, H = height, padL = 32, padR = 12, padT = 10, padB = 26;
+  const W = width, H = height, padL = 34, padR = 12, padT = 10, padB = 26;
   const plotW = W - padL - padR;
   const plotH = H - padT - padB;
 
@@ -1628,17 +1707,43 @@ function TendenciaSVG({ enVentana, seriesVisibles, width = 600, height = 140, ma
   function x(i) { return padL + (plotW * (times[i] - tMin)) / tRango; }
   function y(v) { return padT + plotH - (plotH * v) / maxY; }
 
-  const paso = Math.max(1, Math.ceil((enVentana.length - 1) / (maxEtiquetas - 1)));
+  // Espaciado de etiquetas de hora: en vez de un paso fijo por cantidad de
+  // puntos (que podía dejar dos etiquetas casi pegadas cuando el último
+  // tramo no calzaba justo con el paso — el bug real detrás de "12:16" y
+  // "12:30" solapándose), se reserva un ancho mínimo en píxeles del
+  // viewBox por etiqueta (~70, suficiente para "12:16 p.m." sin que se
+  // toquen) y se calcula cuántas entran de verdad en el ancho disponible,
+  // siempre incluyendo el primer y el último punto.
+  const ANCHO_MIN_POR_ETIQUETA = 70;
+  const maxEtiquetasPorAncho = Math.max(2, Math.floor(plotW / ANCHO_MIN_POR_ETIQUETA) + 1);
+  const etiquetasEfectivas = Math.min(maxEtiquetas, maxEtiquetasPorAncho);
+  const paso = Math.max(1, Math.ceil((enVentana.length - 1) / (etiquetasEfectivas - 1)));
   const indicesEtiquetas = [];
   for (let i = 0; i < enVentana.length; i += paso) indicesEtiquetas.push(i);
-  if (indicesEtiquetas[indicesEtiquetas.length - 1] !== enVentana.length - 1) indicesEtiquetas.push(enVentana.length - 1);
+  if (indicesEtiquetas[indicesEtiquetas.length - 1] !== enVentana.length - 1) {
+    // Si el último punto quedara demasiado cerca del anteúltimo ya
+    // agregado, se reemplaza en vez de sumarse — evita el solape que
+    // causaba el bug original cuando el resto no dividía justo.
+    const anteultimo = indicesEtiquetas[indicesEtiquetas.length - 1];
+    if (anteultimo != null && (x(enVentana.length - 1) - x(anteultimo)) < ANCHO_MIN_POR_ETIQUETA) {
+      indicesEtiquetas[indicesEtiquetas.length - 1] = enVentana.length - 1;
+    } else {
+      indicesEtiquetas.push(enVentana.length - 1);
+    }
+  }
 
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" preserveAspectRatio="none" style={{ height: H }}>
+    // Sin preserveAspectRatio="none": deformaba el texto al estirar el
+    // SVG para llenar el ancho del contenedor (las letras se veían
+    // "raras", achatadas/estiradas horizontalmente) porque el viewBox no
+    // tenía la misma proporción que el contenedor real. Con
+    // "xMidYMid meet" el SVG escala parejo en X e Y, así que el texto
+    // siempre se ve con sus proporciones normales.
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" preserveAspectRatio="xMidYMid meet" style={{ maxHeight: H }}>
       {[0, maxY / 2, maxY].map((v, i) => (
         <g key={i}>
           <line x1={padL} x2={W - padR} y1={y(v)} y2={y(v)} stroke="#1E332C" strokeWidth="1" />
-          <text x={padL - 6} y={y(v) + 3} textAnchor="end" fontSize="9" fill="#7C8F88" fontFamily="IBM Plex Mono, monospace">
+          <text x={padL - 6} y={y(v) + 3} textAnchor="end" fontSize="10" fill="#7C8F88" fontFamily="IBM Plex Mono, monospace">
             {Math.round(v)}
           </text>
         </g>
@@ -1667,7 +1772,7 @@ function TendenciaSVG({ enVentana, seriesVisibles, width = 600, height = 140, ma
           x={x(i)}
           y={H - 4}
           textAnchor={i === 0 ? "start" : i === enVentana.length - 1 ? "end" : "middle"}
-          fontSize="9"
+          fontSize="10"
           fill="#7C8F88"
           fontFamily="IBM Plex Mono, monospace"
         >
