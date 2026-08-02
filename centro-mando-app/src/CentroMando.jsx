@@ -512,7 +512,9 @@ function StationCard({ station, index, onOpen }) {
         )}
 
         <div className="mt-auto pt-2.5 flex items-center justify-between text-[11px] font-mono font-medium text-[#7C8F88] border-t border-white/[0.08]">
-          <span>{station.fecha}</span>
+          <span title="Hora de generación del mapa de la DGA — no es la hora exacta de medición de este río en particular.">
+            DGA: {station.fecha}
+          </span>
           <span className="flex items-center gap-1 font-semibold group-hover:text-[#7ECBDE]">Detalle →</span>
         </div>
       </div>
@@ -573,7 +575,14 @@ function StationDialog({ station, onClose }) {
           <div className="rounded-lg bg-[#0A1210] border border-[#1E332C] px-5 py-4 mb-4">
             <div className="flex items-center justify-between mb-3">
               <span className="text-xs text-[#C7D3CE] uppercase tracking-wide">{station.parametro || "Medición"}</span>
-              {station.fecha && <span className="font-mono text-[11px] text-[#7C8F88]">{station.fecha}</span>}
+              {station.fecha && (
+                <span
+                  className="font-mono text-[11px] text-[#7C8F88]"
+                  title="Hora de generación del mapa de la DGA (todas las estaciones comparten esta misma hora) — no es la hora exacta en que se midió este río."
+                >
+                  Mapa DGA: {station.fecha}
+                </span>
+              )}
             </div>
             <div className="flex items-end justify-between">
               <p className={`font-mono text-4xl font-bold ${s.text}`}>
@@ -635,8 +644,8 @@ function StationDialog({ station, onClose }) {
             <ExternalLink className="w-4 h-4 flex-shrink-0 text-[#7C8F88]" />
           </a>
 
-          <p className="text-[11px] text-[#7C8F88] font-mono mt-4 pt-4 border-t border-[#1E332C]">
-            Fuente: Dirección General de Aguas (DGA) — Sistema Nacional de Información del Agua (SNIA). Dato de estación física real, no modelo.
+          <p className="text-[11px] text-[#7C8F88] font-mono mt-4 pt-4 border-t border-[#1E332C] leading-relaxed">
+            Fuente: Dirección General de Aguas (DGA) — Sistema Nacional de Información del Agua (SNIA). Dato de estación física real, no modelo. La hora "Mapa DGA" es cuándo la DGA generó su mapa (igual para todas las estaciones), no la hora exacta de esta medición — la DGA no publica esa hora por estación.
           </p>
         </div>
       </div>
