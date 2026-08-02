@@ -144,10 +144,19 @@ const WORKER_URL = import.meta.env.VITE_DGA_WORKER_URL || null;
 // Roja+Amarilla de una sola vez.
 const ESTIMATED_LOAD_MS = 3500;
 
-// Estimado para la carga de UNA categoría con detalle (al pinchar un botón
-// grande). Basado en pruebas reales: peticiones en serie a ~0.7-1s cada
-// una, con hasta MAX_DETALLE_STATIONS (30) estaciones en el peor caso.
-const ESTIMATED_CATEGORIA_LOAD_MS = 18000;
+// Estimado para abrir UNA categoría (al pinchar un botón grande) — ahora
+// es básicamente lo mismo que la carga inicial (Nivel de Agua + tendencia,
+// sin Caudal), ya no los ~18s de cuando esto pedía Caudal de hasta 30
+// estaciones de una. El Caudal ahora se pide aparte, por estación
+// individual — ver ESTIMATED_CAUDAL_LOAD_MS.
+const ESTIMATED_CATEGORIA_LOAD_MS = 3500;
+
+// Estimado para pedir el Caudal de UNA sola estación (botón "Obtener
+// Caudal" en la tarjeta). Basado en el mismo costo por-estación medido
+// antes (~0.7-1s de la propia petición JSF, más el GET inicial para
+// ViewState/cookie) — sigue siendo una sola estación, no un lote, así que
+// es rápido.
+const ESTIMATED_CAUDAL_LOAD_MS = 2500;
 
 // Convierte tiempo transcurrido en progreso de barra (0-100) usando una
 // curva de desaceleración: avanza rápido al principio y se frena cerca del
@@ -188,12 +197,19 @@ async function loadAlertasBasicas() {
   return res.json();
 }
 
-// Carga de detalle (con Caudal) para UNA categoría específica — se llama
-// recién cuando el usuario pincha uno de los 3 botones grandes ("Ver
-// alertas Rojas", etc.), no en la carga inicial.
+// Carga básica de UNA categoría específica — Nivel de Agua + tendencia
+// (subió/bajó), SIN Caudal. Se llama al pinchar uno de los 3 botones
+// grandes ("Ver alertas Rojas", etc.). Antes esto pedía también el Caudal
+// de hasta 30 estaciones de una (?detalle=1), lo que hacía tardar ~15-25s
+// en abrir una categoría entera. Ahora el Caudal se pide aparte, estación
+// por estación, recién cuando el usuario aprieta "Obtener Caudal" en la
+// tarjeta puntual que le interesa (ver loadCaudalEstacion) — esto es
+// rápido (unos segundos, un solo GET al Worker) porque el Worker igual
+// calcula la tendencia contra Sheets en esta misma llamada (no depende del
+// Caudal, ver worker.js → calcularTendencia).
 async function loadAlertasCategoria(color) {
   if (WORKER_URL) {
-    const endpoint = `${WORKER_URL.replace(/\/$/, "")}/alertas?detalle=1&color=${encodeURIComponent(color)}`;
+    const endpoint = `${WORKER_URL.replace(/\/$/, "")}/alertas?color=${encodeURIComponent(color)}`;
     const res = await fetch(endpoint, { cache: "no-store" });
     if (!res.ok) throw new Error(`El Worker respondió con error (HTTP ${res.status}).`);
     return res.json();
@@ -204,6 +220,18 @@ async function loadAlertasCategoria(color) {
   if (!res.ok) throw new Error("No se pudo cargar alertas-rios.json");
   const json = await res.json();
   return { ...json, estaciones: (json.estaciones || []).filter(s => s.tipoAlerta === color) };
+}
+
+// Caudal de UNA estación puntual — se llama al apretar "Obtener Caudal" en
+// una tarjeta de la grilla. Sin Worker configurado no hay forma de pedir
+// esto bajo demanda (el archivo estático es fijo), así que devuelve null y
+// el botón queda deshabilitado en ese modo (ver CategoryButton/StationCard).
+async function loadCaudalEstacion(codigo, tipoEstacion) {
+  if (!WORKER_URL) return null;
+  const endpoint = `${WORKER_URL.replace(/\/$/, "")}/caudal?codigo=${encodeURIComponent(codigo)}&tipoEstacion=${encodeURIComponent(tipoEstacion || "")}`;
+  const res = await fetch(endpoint, { cache: "no-store" });
+  if (!res.ok) throw new Error(`El Worker respondió con error (HTTP ${res.status}).`);
+  return res.json();
 }
 
 export default function CentroMando() {
@@ -219,13 +247,23 @@ export default function CentroMando() {
 
   // `categoriaAbierta`: null | "Roja" | "Amarilla" | "Azul" — cuál de los 3
   // botones grandes está expandido ahora mismo mostrando su grilla de
-  // tarjetas. `detalleCategoria` es la respuesta CON Caudal de esa
-  // categoría, pedida recién al pinchar el botón — no antes.
+  // tarjetas. `detalleCategoria` es la respuesta básica (Nivel de Agua +
+  // tendencia, SIN Caudal) de esa categoría, pedida al pinchar el botón.
+  // El Caudal de cada estación se pide aparte — ver caudalPorEstacion.
   const [categoriaAbierta, setCategoriaAbierta] = useState(null);
   const [detalleCategoria, setDetalleCategoria] = useState(null);
   const [loadingCategoria, setLoadingCategoria] = useState(false);
   const [errorCategoria, setErrorCategoria] = useState(null);
   const [elapsedCategoriaMs, setElapsedCategoriaMs] = useState(0);
+
+  // Caudal pedido bajo demanda, por estación — clave: código de estación,
+  // valor: { loading, error, detalle }. Vive aparte de `detalleCategoria`
+  // porque cada tarjeta pide su propio Caudal de forma independiente (al
+  // apretar "Obtener Caudal"), no las 30 de una categoría juntas como
+  // antes. Se resetea entero cada vez que se abre/cierra una categoría o
+  // se hace un refresh general, para no arrastrar Caudal de una corrida
+  // vieja a datos de estaciones nuevos.
+  const [caudalPorEstacion, setCaudalPorEstacion] = useState({});
 
   async function refresh() {
     setLoading(true);
@@ -235,6 +273,7 @@ export default function CentroMando() {
     // datos de detalle quedarían basados en la carga anterior.
     setCategoriaAbierta(null);
     setDetalleCategoria(null);
+    setCaudalPorEstacion({});
     try {
       const json = await loadAlertasBasicas();
       setData(json);
@@ -255,6 +294,7 @@ export default function CentroMando() {
     setErrorCategoria(null);
     setLoadingCategoria(true);
     setElapsedCategoriaMs(0);
+    setCaudalPorEstacion({});
     try {
       const json = await loadAlertasCategoria(color);
       setDetalleCategoria(json);
@@ -269,6 +309,23 @@ export default function CentroMando() {
     setCategoriaAbierta(null);
     setDetalleCategoria(null);
     setErrorCategoria(null);
+    setCaudalPorEstacion({});
+  }
+
+  // Pide el Caudal de UNA estación puntual — se llama al apretar "Obtener
+  // Caudal" en su tarjeta. No toca `detalleCategoria` ni recarga nada más;
+  // solo guarda el resultado en caudalPorEstacion[codigo], y StationCard /
+  // StationDialog lo leen de ahí para mostrarlo junto al Nivel de Agua que
+  // ya tenían de la carga básica.
+  async function obtenerCaudal(station) {
+    const codigo = station.codigo;
+    setCaudalPorEstacion(prev => ({ ...prev, [codigo]: { loading: true, error: null, detalle: null } }));
+    try {
+      const json = await loadCaudalEstacion(codigo, station.tipoEstacion);
+      setCaudalPorEstacion(prev => ({ ...prev, [codigo]: { loading: false, error: null, detalle: json?.detalle ?? null } }));
+    } catch (e) {
+      setCaudalPorEstacion(prev => ({ ...prev, [codigo]: { loading: false, error: e.message || "Error desconocido", detalle: null } }));
+    }
   }
 
   useEffect(() => {
@@ -307,11 +364,26 @@ export default function CentroMando() {
     return c;
   }, [sorted]);
 
-  // Estaciones CON Caudal de la categoría actualmente abierta (si hay una).
+  // Estaciones de la categoría actualmente abierta (Nivel de Agua +
+  // tendencia, de la carga básica), con el Caudal mezclado adentro si ya
+  // se pidió para esa estación puntual (ver caudalPorEstacion/
+  // obtenerCaudal). `caudalEstado` viaja aparte de `detalle` para que
+  // StationCard pueda distinguir "todavía no se pidió", "cargando" y
+  // "error" sin confundirlos con "se pidió y la DGA no tiene el dato" (que
+  // sigue siendo detalle.caudalM3s == null, igual que antes).
   const sortedCategoria = useMemo(() => {
     if (!detalleCategoria?.estaciones) return [];
-    return sortByUrgency(detalleCategoria.estaciones);
-  }, [detalleCategoria]);
+    const conCaudal = detalleCategoria.estaciones.map(s => {
+      const estado = caudalPorEstacion[s.codigo];
+      if (!estado) return s;
+      return {
+        ...s,
+        detalle: estado.detalle ?? s.detalle,
+        caudalEstado: { loading: estado.loading, error: estado.error },
+      };
+    });
+    return sortByUrgency(conCaudal);
+  }, [detalleCategoria, caudalPorEstacion]);
 
   const byRegion = useMemo(() => groupByRegion(sorted), [sorted]);
 
@@ -546,9 +618,9 @@ export default function CentroMando() {
         )}
 
         {/* Sección expandible: se muestra solo cuando el usuario pinchó
-            uno de los 3 botones. Acá sí vive la grilla de tarjetas con
-            Caudal, igual que el diseño anterior — solo que ahora es
-            "bajo demanda" en vez de cargarse siempre de entrada. */}
+            uno de los 3 botones. La grilla trae Nivel de Agua + tendencia
+            de inmediato; el Caudal de cada tarjeta se pide aparte, al
+            apretar su botón "Obtener Caudal" (ver obtenerCaudal). */}
         {categoriaAbierta && (
           <section className="mb-8">
             <CategoriaExpandida
@@ -560,6 +632,7 @@ export default function CentroMando() {
               onRetry={() => abrirCategoria(categoriaAbierta)}
               onClose={cerrarCategoria}
               onOpenStation={setSelected}
+              onObtenerCaudal={obtenerCaudal}
             />
           </section>
         )}
@@ -583,10 +656,11 @@ export default function CentroMando() {
 
       {selected && (
         <StationDialog
-          station={selected}
+          station={sortedCategoria.find(s => s.codigo === selected.codigo) || selected}
           estacionesCategoria={sortedCategoria}
           onClose={() => setSelected(null)}
           onOpenStation={setSelected}
+          onObtenerCaudal={obtenerCaudal}
         />
       )}
       </>
@@ -683,12 +757,12 @@ function CategoryButton({ styleKey, label, count, active, blocked, onClick }) {
 // Vive debajo de los 3 botones + el mapa. Maneja sus propios estados de
 // carga/error porque el detalle de esta categoría se pide de forma
 // independiente a la carga básica inicial.
-function CategoriaExpandida({ color, loading, error, elapsedMs, estaciones, onRetry, onClose, onOpenStation }) {
+function CategoriaExpandida({ color, loading, error, elapsedMs, estaciones, onRetry, onClose, onOpenStation, onObtenerCaudal }) {
   const s = ALERT_STYLES[color];
   return (
     <div className={`rounded-xl border ${s.borderSoft} ${s.bg} p-5`}>
       <div className="flex items-center justify-between mb-4">
-        <h2 className={`font-display font-bold text-lg ${s.text}`}>Alertas {color} — detalle con Caudal</h2>
+        <h2 className={`font-display font-bold text-lg ${s.text}`}>Alertas {color}</h2>
         <button
           onClick={onClose}
           className="p-1.5 rounded-md text-[#9BAEA8] hover:text-white hover:bg-black/20 transition-colors"
@@ -701,7 +775,7 @@ function CategoriaExpandida({ color, loading, error, elapsedMs, estaciones, onRe
       {loading && (
         <div className="flex flex-col items-center justify-center gap-3 py-12 text-center">
           <RefreshCw className="w-5 h-5 text-[#7ECBDE] animate-spin" />
-          <p className="font-mono text-[12px] text-[#9BAEA8]">Consultando Caudal en la DGA, estación por estación...</p>
+          <p className="font-mono text-[12px] text-[#9BAEA8]">Consultando Nivel de Agua en la DGA...</p>
           <div className="w-full max-w-xs">
             <div className="h-1.5 rounded-full bg-[#1E332C] overflow-hidden">
               <div
@@ -739,6 +813,7 @@ function CategoriaExpandida({ color, loading, error, elapsedMs, estaciones, onRe
               station={station}
               index={i}
               onOpen={() => onOpenStation(station)}
+              onObtenerCaudal={onObtenerCaudal}
             />
           ))}
         </div>
@@ -748,19 +823,35 @@ function CategoriaExpandida({ color, loading, error, elapsedMs, estaciones, onRe
 }
 
 // ---------- Station Card ----------
-function StationCard({ station, index, onOpen }) {
+function StationCard({ station, index, onOpen, onObtenerCaudal }) {
   const s = ALERT_STYLES[station.tipoAlerta] || ALERT_STYLES.Azul;
   const caudal = station.detalle?.caudalM3s;
+  // `station.detalle` puede existir con caudalM3s en null porque la DGA
+  // fue consultada y no lo reportó (ver worker.js) — eso es distinto de
+  // "todavía no se pidió". Solo en el segundo caso mostramos el botón
+  // "Obtener Caudal"; en el primero, el mensaje de "no disponible" (con
+  // sugerencia cercana, si aplica, dentro del diálogo de detalle).
+  const yaConsultado = station.detalle != null;
+  const caudalLoading = station.caudalEstado?.loading;
+  const caudalError = station.caudalEstado?.error;
   const exceso = station.umbral ? Math.round(((station.valorMedicion - station.umbral) / station.umbral) * 100) : null;
 
+  function handleObtenerCaudal(e) {
+    e.stopPropagation(); // no abrir la ficha de detalle al pinchar este botón puntual
+    onObtenerCaudal(station);
+  }
+
   return (
-    <button
+    <div
+      role="button"
+      tabIndex={0}
       onClick={onOpen}
+      onKeyDown={e => { if (e.key === "Enter" || e.key === " ") onOpen(); }}
       style={{
         animationDelay: `${Math.min(index, 14) * 35}ms`,
         borderColor: s.pulse ? "rgba(232,73,46,0.7)" : undefined,
       }}
-      className={`rise-in group relative text-left rounded-xl border-2 overflow-hidden flex flex-col transition-transform hover:-translate-y-0.5 ${
+      className={`rise-in group relative text-left rounded-xl border-2 overflow-hidden flex flex-col transition-transform hover:-translate-y-0.5 cursor-pointer ${
         s.pulse ? "urgent-pulse" : `${s.borderSoft} ${s.bg} hover:border-opacity-90`
       }`}
     >
@@ -800,7 +891,8 @@ function StationCard({ station, index, onOpen }) {
           )}
         </div>
 
-        {/* Caudal, si está disponible — bloque propio para que se note tanto como el nivel de agua */}
+        {/* Caudal: 4 estados posibles — ya lo tenemos, cargando, botón para
+            pedirlo, o "no disponible" (la DGA fue consultada y no lo dio). */}
         {caudal != null && (
           <div className="rounded-lg bg-[#0A1210]/40 border border-white/[0.06] px-3.5 py-2.5 mb-2.5">
             <div className="flex items-center justify-between">
@@ -813,11 +905,49 @@ function StationCard({ station, index, onOpen }) {
         )}
 
         {/* En Azul no se pide Caudal (ver worker.js) — se aclara para que no
-            parezca un dato faltante por error de red. */}
+            parezca un dato faltante por error de red, y no se ofrece el botón. */}
         {caudal == null && station.tipoAlerta === "Azul" && (
           <p className="text-[10px] text-[#5C726A] mb-2.5 leading-relaxed">
             Caudal no calculado para alertas Azul
           </p>
+        )}
+
+        {/* Ya se consultó pero la DGA no reportó Caudal — no tiene sentido
+            reintentar automático (ver la nota de condición de carrera en
+            worker.js), pero se deja el botón para que el usuario reintente
+            si quiere. */}
+        {caudal == null && station.tipoAlerta !== "Azul" && yaConsultado && !caudalLoading && (
+          <div className="mb-2.5">
+            <p className="text-[10px] text-[#5C726A] mb-1.5 leading-relaxed">
+              {caudalError ? `No se pudo obtener: ${caudalError}` : "La DGA no reportó Caudal para esta estación."}
+            </p>
+            <button
+              onClick={handleObtenerCaudal}
+              disabled={!onObtenerCaudal || !WORKER_URL}
+              className="w-full text-center font-mono text-[11px] font-semibold text-[#7ECBDE] border border-[#3B8FA3]/40 rounded-md py-1.5 hover:bg-[#3B8FA3]/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              Reintentar
+            </button>
+          </div>
+        )}
+
+        {/* Todavía no se pidió Caudal para esta estación — botón principal. */}
+        {caudal == null && station.tipoAlerta !== "Azul" && !yaConsultado && !caudalLoading && (
+          <button
+            onClick={handleObtenerCaudal}
+            disabled={!onObtenerCaudal || !WORKER_URL}
+            title={!WORKER_URL ? "Requiere un Worker configurado (VITE_DGA_WORKER_URL) — ver README." : undefined}
+            className={`mb-2.5 w-full text-center font-mono text-[12px] font-bold rounded-lg border py-2.5 transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${s.borderSoft} ${s.text} hover:bg-white/[0.04]`}
+          >
+            Obtener Caudal
+          </button>
+        )}
+
+        {caudalLoading && (
+          <div className="mb-2.5 w-full flex items-center justify-center gap-2 font-mono text-[12px] font-semibold text-[#9BAEA8] border border-white/10 rounded-lg py-2.5">
+            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+            Consultando Caudal...
+          </div>
         )}
 
         <div className="mt-auto pt-2.5 flex items-center justify-between text-[11px] font-mono font-medium text-[#7C8F88] border-t border-white/[0.08]">
@@ -827,12 +957,12 @@ function StationCard({ station, index, onOpen }) {
           <span className="flex items-center gap-1 font-semibold group-hover:text-[#7ECBDE]">Detalle →</span>
         </div>
       </div>
-    </button>
+    </div>
   );
 }
 
 // ---------- Station Detail Dialog ----------
-function StationDialog({ station, estacionesCategoria, onClose, onOpenStation }) {
+function StationDialog({ station, estacionesCategoria, onClose, onOpenStation, onObtenerCaudal }) {
   useEffect(() => {
     function onKey(e) { if (e.key === "Escape") onClose(); }
     window.addEventListener("keydown", onKey);
@@ -939,15 +1069,47 @@ function StationDialog({ station, estacionesCategoria, onClose, onOpenStation })
             </div>
           )}
           {(!d || !hayAlgunDetalle) && (
-            <div className="flex items-start gap-2 rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-3 mb-4">
-              <Radio className="w-3.5 h-3.5 text-[#7C8F88] flex-shrink-0 mt-0.5" />
-              <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
-                {station.tipoAlerta === "Azul"
-                  ? "Esta estación está en alerta Azul — el Caudal solo se calcula para alertas Roja y Amarilla, para mantener la carga rápida."
-                  : d
-                    ? "La DGA consultó esta estación pero no reportó Caudal ni Precipitación — es posible que no tenga esos sensores instalados."
-                    : <>Sin datos de Caudal/Precipitación — corré el script con <code className="text-[#7ECBDE] font-mono">--detalle</code> para incluirlos.</>}
-              </p>
+            <div className="mb-4">
+              {station.tipoAlerta === "Azul" ? (
+                <div className="flex items-start gap-2 rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-3">
+                  <Radio className="w-3.5 h-3.5 text-[#7C8F88] flex-shrink-0 mt-0.5" />
+                  <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
+                    Esta estación está en alerta Azul — el Caudal solo se calcula para alertas Roja y Amarilla, para mantener la carga rápida.
+                  </p>
+                </div>
+              ) : d ? (
+                <div className="flex items-start gap-2 rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-3">
+                  <Radio className="w-3.5 h-3.5 text-[#7C8F88] flex-shrink-0 mt-0.5" />
+                  <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
+                    La DGA consultó esta estación pero no reportó Caudal ni Precipitación — es posible que no tenga esos sensores instalados.
+                  </p>
+                </div>
+              ) : !WORKER_URL ? (
+                <div className="flex items-start gap-2 rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-3">
+                  <Radio className="w-3.5 h-3.5 text-[#7C8F88] flex-shrink-0 mt-0.5" />
+                  <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
+                    Sin datos de Caudal/Precipitación — corré el script con <code className="text-[#7ECBDE] font-mono">--detalle</code> para incluirlos, o configurá <code className="text-[#7ECBDE] font-mono">VITE_DGA_WORKER_URL</code> para pedirlo bajo demanda.
+                  </p>
+                </div>
+              ) : station.caudalEstado?.loading ? (
+                <div className="w-full flex items-center justify-center gap-2 font-mono text-[12px] font-semibold text-[#9BAEA8] border border-white/10 rounded-lg py-3">
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  Consultando Caudal en la DGA...
+                </div>
+              ) : (
+                <>
+                  {station.caudalEstado?.error && (
+                    <p className="text-[11px] text-[#9BAEA8] mb-2">No se pudo obtener: {station.caudalEstado.error}</p>
+                  )}
+                  <button
+                    onClick={() => onObtenerCaudal(station)}
+                    disabled={!onObtenerCaudal || !WORKER_URL}
+                    className={`w-full text-center font-mono text-[13px] font-bold rounded-lg border py-3 transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${s.borderSoft} ${s.text} hover:bg-white/[0.04]`}
+                  >
+                    Obtener Caudal
+                  </button>
+                </>
+              )}
             </div>
           )}
 

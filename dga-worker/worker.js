@@ -477,6 +477,32 @@ async function handleAlertas(url, env) {
   const elegiblesParaDetalle = outputStations.filter(s => detalleAplicaA.includes(s.tipoAlerta));
   const sinDetallePorNivel = outputStations.length - elegiblesParaDetalle.length;
 
+  // Tendencia contra el histórico de Sheets: solo cuando el usuario abrió
+  // una categoría específica (?color=), que es el único caso donde el
+  // dashboard realmente pide y muestra esto. Depende SOLO de valorMedicion
+  // (Nivel de Agua, ya viene en la carga básica) — no depende del Caudal en
+  // absoluto, así que se calcula acá afuera de `wantDetalle`: antes vivía
+  // adentro de ese bloque porque el dashboard viejo siempre pedía Caudal y
+  // tendencia juntos, pero ahora el Caudal se pide aparte, por estación
+  // individual (ver /caudal más abajo), y la tendencia debe seguir
+  // llegando de inmediato con la carga básica de la categoría.
+  if (colorFiltro && outputStations.length > 0) {
+    try {
+      const allRows = await readAllSnapshotRows(env);
+      const codigos = outputStations.map(s => s.codigo);
+      const previos = findLatestPreviousByCode(allRows, codigos);
+      for (const s of outputStations) {
+        const previo = previos.get(s.codigo);
+        s.tendencia = calcularTendencia(s, previo);
+      }
+    } catch (e) {
+      // Si Sheets falla (credenciales, cuota, etc.), no tiene sentido
+      // romper toda la respuesta por un dato secundario — las
+      // estaciones simplemente quedan sin `tendencia`, el dashboard ya
+      // maneja su ausencia sin problema.
+    }
+  }
+
   if (wantDetalle) {
     const logger = makeLogCollector();
     const target = elegiblesParaDetalle.slice(0, MAX_DETALLE_STATIONS);
@@ -492,28 +518,6 @@ async function handleAlertas(url, env) {
       // sigue devolviendo las alertas básicas sin detalle, en vez de fallar
       // toda la respuesta.
       logger.error(`[detalle] No se pudo obtener el ViewState: ${e.message || e}`);
-    }
-
-    // Tendencia contra el histórico de Sheets: solo cuando el usuario abrió
-    // una categoría específica (?color=), que es el único caso donde el
-    // dashboard realmente pide y muestra esto — evita leer Sheets en el
-    // modo histórico Roja+Amarilla combinado, que ya no usa el dashboard
-    // pero se mantiene por compatibilidad.
-    if (colorFiltro) {
-      try {
-        const allRows = await readAllSnapshotRows(env);
-        const codigos = target.map(s => s.codigo);
-        const previos = findLatestPreviousByCode(allRows, codigos);
-        for (const s of target) {
-          const previo = previos.get(s.codigo);
-          s.tendencia = calcularTendencia(s, previo);
-        }
-      } catch (e) {
-        // Si Sheets falla (credenciales, cuota, etc.), no tiene sentido
-        // romper toda la respuesta por un dato secundario — las
-        // estaciones simplemente quedan sin `tendencia`, el dashboard ya
-        // maneja su ausencia sin problema.
-      }
     }
 
     // Manda todos los mensajes juntados durante esta corrida a la hoja
@@ -550,6 +554,39 @@ async function handleAlertas(url, env) {
   };
 }
 
+// -----------------------------------------------------------------------
+// Detalle (Caudal, Precipitación, etc.) de UNA sola estación, bajo demanda
+// — endpoint /caudal. Antes esto solo existía empaquetado dentro de
+// /alertas?detalle=1, que consultaba hasta 30 estaciones de una categoría
+// entera en cada apertura (~15-25s, y le pegaba a la DGA 30 veces aunque
+// el usuario solo quisiera ver 2 o 3 tarjetas). Con este endpoint, el
+// dashboard pide el Caudal de una tarjeta puntual recién cuando el usuario
+// aprieta el botón "Obtener Caudal" en ESA tarjeta — mucho más rápido de
+// entrada (la grilla se pinta con Nivel de Agua + tendencia al toque) y
+// muchísimas menos peticiones a la DGA en total.
+// -----------------------------------------------------------------------
+async function handleCaudalEstacion(url, env) {
+  const codigo = url.searchParams.get("codigo");
+  if (!codigo) {
+    throw new Error("Falta el parámetro codigo.");
+  }
+  const tipoEstacion = url.searchParams.get("tipoEstacion") || "";
+
+  const logger = makeLogCollector();
+  const { viewState, cookie } = await getViewState();
+  const detalle = await fetchStationDetail(viewState, cookie, codigo, tipoEstacion, logger);
+
+  if (logger.entries.length > 0) {
+    try {
+      await appendLogRows(env, logger.entries);
+    } catch (e) {
+      console.error("[sheets] No se pudo escribir el log de diagnóstico en LOG:", e.message || e);
+    }
+  }
+
+  return { codigo, detalle };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -563,11 +600,15 @@ export default {
         servicio: "Alertas de Ríos DGA — Worker",
         endpoints: [
           "/alertas",
+          "/alertas?color=Roja",
+          "/alertas?color=Amarilla",
+          "/alertas?color=Azul",
           "/alertas?detalle=1",
           "/alertas?detalle=1&color=Roja",
           "/alertas?detalle=1&color=Amarilla",
           "/alertas?detalle=1&color=Azul",
           "/alertas?all=1",
+          "/caudal?codigo=XXXXXXX-X&tipoEstacion=Fluviometricas",
         ],
       });
     }
@@ -575,6 +616,15 @@ export default {
     if (url.pathname === "/alertas") {
       try {
         const data = await handleAlertas(url, env);
+        return jsonResponse(data);
+      } catch (e) {
+        return jsonResponse({ error: e.message || "Error desconocido" }, 502);
+      }
+    }
+
+    if (url.pathname === "/caudal") {
+      try {
+        const data = await handleCaudalEstacion(url, env);
         return jsonResponse(data);
       } catch (e) {
         return jsonResponse({ error: e.message || "Error desconocido" }, 502);
