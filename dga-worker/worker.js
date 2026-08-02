@@ -401,6 +401,18 @@ async function handleAlertas(url, env) {
   const enAlerta = stations.filter(s => s.alerta);
   let outputStations = wantAll ? stations : enAlerta;
 
+  // Con ?color=Roja (o Amarilla/Azul), el dashboard pidió el detalle de UNA
+  // categoría específica (uno de los 3 botones grandes) — el array de
+  // salida debe traer SOLO esa categoría, si no el frontend recibe todas
+  // las alertas mezcladas (bug detectado: "Ver alertas Rojas" mostraba
+  // también Amarillas, porque este filtro faltaba acá y el frontend confía
+  // en que el Worker ya filtró). Sin ?color= (ej. wantAll, o llamadas
+  // viejas sin este parámetro), se mantiene el comportamiento histórico de
+  // devolver todas las alertas juntas.
+  if (colorFiltro) {
+    outputStations = outputStations.filter(s => colorFiltro.includes(s.tipoAlerta));
+  }
+
   // Sin ?color=, el criterio histórico sigue siendo Roja+Amarilla (Azul
   // excluida por defecto, ver nota más abajo). Con ?color=, se usa
   // exactamente esa categoría — incluyendo Azul si se pide explícitamente,
