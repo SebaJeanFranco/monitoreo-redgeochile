@@ -45,7 +45,7 @@
  * Sheets ni de credenciales.
  */
 
-import { appendSnapshotRows, appendLogRows, readAllSnapshotRows, findLatestPreviousByCode, historicoPorCodigo, resumenPorCorrida } from "./sheets.js";
+import { appendSnapshotRows, appendLogRows, readAllSnapshotRows, findLatestPreviousByCode, historicoPorCodigo, resumenPorCorrida, resumenPorRegionYCorrida } from "./sheets.js";
 
 const SNIA_URL = "https://snia.mop.gob.cl/sat/site/informes/mapas/mapas.xhtml";
 
@@ -477,16 +477,21 @@ async function handleAlertas(url, env) {
   const elegiblesParaDetalle = outputStations.filter(s => detalleAplicaA.includes(s.tipoAlerta));
   const sinDetallePorNivel = outputStations.length - elegiblesParaDetalle.length;
 
-  // Tendencia contra el histórico de Sheets: solo cuando el usuario abrió
-  // una categoría específica (?color=), que es el único caso donde el
-  // dashboard realmente pide y muestra esto. Depende SOLO de valorMedicion
-  // (Nivel de Agua, ya viene en la carga básica) — no depende del Caudal en
-  // absoluto, así que se calcula acá afuera de `wantDetalle`: antes vivía
-  // adentro de ese bloque porque el dashboard viejo siempre pedía Caudal y
-  // tendencia juntos, pero ahora el Caudal se pide aparte, por estación
-  // individual (ver /caudal más abajo), y la tendencia debe seguir
-  // llegando de inmediato con la carga básica de la categoría.
-  if (colorFiltro && outputStations.length > 0) {
+  // Tendencia contra el histórico de Sheets: se calcula para toda
+  // `outputStations`, tenga o no colorFiltro — antes se limitaba a "solo
+  // cuando se abrió una categoría específica", pero el panorama general
+  // (sin ?color=) y el informe de texto (que lee del panorama general)
+  // también la necesitan para poder mostrar el % de variación de cada
+  // estación desde su última lectura en Sheets. Depende SOLO de
+  // valorMedicion (Nivel de Agua, ya viene en la carga básica) — no
+  // depende del Caudal en absoluto, así que se calcula acá afuera de
+  // `wantDetalle` sin costo adicional de scraping a la DGA.
+  //
+  // Se excluye wantAll: ahí outputStations son TODAS las ~1800 estaciones
+  // del país (con o sin alerta), no solo las relevantes — calcular
+  // tendencia para todas sería un costo innecesario ya que el dashboard
+  // nunca muestra tendencia de estaciones sin alerta.
+  if (!wantAll && outputStations.length > 0) {
     try {
       const allRows = await readAllSnapshotRows(env);
       const codigos = outputStations.map(s => s.codigo);
@@ -625,7 +630,11 @@ async function handleResumenNacional(env) {
   // lado del cliente.
   const allRows = await readAllSnapshotRows(env, 3000);
   const corridas = resumenPorCorrida(allRows);
-  return { corridas };
+  // Desglose por región, misma fuente de datos — usado para mostrar la
+  // variación de cada región del panorama general (ver
+  // RegionCard/calcularVariacionRegion en el frontend).
+  const corridasPorRegion = resumenPorRegionYCorrida(allRows);
+  return { corridas, corridasPorRegion };
 }
 
 export default {

@@ -206,6 +206,10 @@ function tituloLegible(nombre) {
     .join(" ");
 }
 
+// Arma el texto del informe a partir de `stations` — se espera que ya
+// vengan filtradas a Roja/Amarilla (ver generarInforme en CentroMando:
+// Azul se excluye antes de llegar acá, no es responsabilidad de esta
+// función filtrar por color).
 function generarInformeTexto(stations, generadoEn) {
   const porRegion = new Map();
   for (const s of stations) {
@@ -252,9 +256,24 @@ function generarInformeTexto(stations, generadoEn) {
       // cada línea innecesariamente cuando no hay dato.
       const caudal = s.detalle?.caudalM3s;
       const caudalTexto = caudal != null ? ` Caudal: ${caudal} m³/seg.` : "";
+      // Variación respecto al último dato guardado en Sheets (calculada
+      // por el Worker comparando contra la corrida anterior del cron, ver
+      // calcularTendencia en worker.js) — "estable" no se anuncia para no
+      // alargar la línea quando no cambió nada; "subiendo"/"bajando" sí,
+      // con el % y los minutos desde esa lectura anterior. Si la estación
+      // es nueva en alerta (sin lectura previa todavía), tendencia es
+      // null y esta parte del texto simplemente se omite.
+      let variacionTexto = "";
+      if (s.tendencia && s.tendencia.direccion !== "estable" && s.tendencia.porcentaje != null) {
+        const flecha = s.tendencia.direccion === "subiendo" ? "↑" : "↓";
+        const minutos = s.tendencia.timestampAnterior
+          ? Math.max(1, Math.round((Date.now() - new Date(s.tendencia.timestampAnterior).getTime()) / 60000))
+          : null;
+        variacionTexto = ` ${flecha} ${Math.abs(s.tendencia.porcentaje)}% ${s.tendencia.direccion}${minutos != null ? ` (últimos ${minutos} min)` : ""}.`;
+      }
       const nombreLegible = tituloLegible(s.nombre);
       lineas.push(
-        `${emoji} ${nombreLegible}: Superó el umbral ${colorUmbral} con un nivel de aguas de ${s.valorMedicion} ${s.unidad || "m"}, lo que equivale a ${excesoTexto} sobre el umbral.${caudalTexto}`
+        `${emoji} ${nombreLegible}: Superó el umbral ${colorUmbral} con un nivel de aguas de ${s.valorMedicion} ${s.unidad || "m"}, lo que equivale a ${excesoTexto} sobre el umbral.${caudalTexto}${variacionTexto}`
       );
     }
     lineas.push("");
@@ -436,29 +455,26 @@ export default function CentroMando() {
   const [tendenciaExpandida, setTendenciaExpandida] = useState(false);
 
   // Generador de informe de texto (agrupado por región, listo para
-  // copiar/pegar). Dos versiones separadas: rápida (solo con lo que ya
-  // hay en memoria, sin Caudal) y con Caudal (consulta la DGA estación
-  // por estación para las Roja/Amarilla que todavía no lo tengan). Se
-  // separaron en dos botones para que nadie dispare sin querer la versión
-  // lenta pensando que iba a ser instantánea.
+  // copiar/pegar). Incluye solo estaciones Roja y Amarilla — Azul queda
+  // afuera del informe por completo (no son situaciones de crecida o
+  // desborde). Siempre consulta el Caudal a la DGA estación por estación
+  // (para las que todavía no lo tengan pedido desde las tarjetas), así
+  // que puede tardar bastante según cuántas alertas Roja/Amarilla haya.
   const [informeTexto, setInformeTexto] = useState(null);
   const [generandoInforme, setGenerandoInforme] = useState(false);
   const [informeCopiado, setInformeCopiado] = useState(false);
   const [progresoInforme, setProgresoInforme] = useState({ hechas: 0, total: 0, segTranscurridos: 0 });
+  // Tiempo total que tardó la última generación — se congela al terminar
+  // (a diferencia de progresoInforme.segTranscurridos, que se resetea en
+  // la siguiente corrida) para poder mostrarlo en el diálogo del informe
+  // ya generado.
+  const [informeSegDemorado, setInformeSegDemorado] = useState(null);
 
-  async function generarInforme(conCaudal) {
+  async function generarInforme() {
     setGenerandoInforme(true);
     setInformeCopiado(false);
+    setInformeSegDemorado(null);
     setProgresoInforme({ hechas: 0, total: 0, segTranscurridos: 0 });
-
-    if (!conCaudal) {
-      // Versión rápida: nada que pedir, el texto sale directo de lo que
-      // ya está cargado en `sorted`.
-      const texto = generarInformeTexto(sorted, data?.generadoEn);
-      setInformeTexto(texto);
-      setGenerandoInforme(false);
-      return;
-    }
 
     const inicio = Date.now();
     // Cronómetro visible mientras dura la consulta — muestra tiempo
@@ -468,12 +484,9 @@ export default function CentroMando() {
       setProgresoInforme(prev => ({ ...prev, segTranscurridos: Math.round((Date.now() - inicio) / 1000) }));
     }, 250);
 
-    // Estaciones que necesitan Caudal para el informe: Roja y Amarilla
-    // únicamente (mismo criterio que el resto del dashboard — Azul nunca
-    // pide Caudal, ver worker.js). Se arma un mapa local código→detalle
-    // que arranca con lo que YA se haya pedido antes desde las tarjetas
-    // (caudalPorEstacion), para no re-consultar de nuevo lo que ya se
-    // tiene.
+    // Solo Roja y Amarilla entran al informe — Azul se excluye por
+    // completo (ni se muestra ni se le pide Caudal, mismo criterio que ya
+    // usa el resto del dashboard para no pedirle Caudal a Azul).
     const elegibles = sorted.filter(s => s.tipoAlerta === "Roja" || s.tipoAlerta === "Amarilla");
     const caudalPorCodigo = new Map();
     for (const s of elegibles) {
@@ -501,11 +514,12 @@ export default function CentroMando() {
     }
 
     clearInterval(cronometro);
+    setInformeSegDemorado(Math.round((Date.now() - inicio) / 1000));
 
-    // Estaciones enriquecidas con el Caudal recién obtenido, para pasarle
-    // al generador de texto — no se pisa `sorted` ni `caudalPorEstacion`
-    // del resto del dashboard, esto es solo para el informe.
-    const stationsConCaudal = sorted.map(s => {
+    // Estaciones enriquecidas con el Caudal recién obtenido — ya filtradas
+    // a solo Roja/Amarilla (`elegibles`, no `sorted`), así Azul nunca
+    // llega al texto final del informe.
+    const stationsConCaudal = elegibles.map(s => {
       const detalle = caudalPorCodigo.get(s.codigo);
       return detalle ? { ...s, detalle } : s;
     });
@@ -785,22 +799,13 @@ export default function CentroMando() {
 
             <div className="flex-1 flex justify-end gap-2.5 flex-wrap">
               <button
-                onClick={() => generarInforme(false)}
+                onClick={generarInforme}
                 disabled={loading || sorted.length === 0 || generandoInforme}
-                title="Informe instantáneo, sin Caudal"
+                title="Consulta el Caudal de cada estación Roja/Amarilla en la DGA — puede tardar bastante"
                 className="flex items-center gap-2 px-4 py-2.5 rounded-md border border-[#2A4038] text-[#DCE7E3] hover:text-white hover:border-[#3B8FA3]/60 text-[14px] font-semibold transition-colors disabled:opacity-50"
               >
                 <FileText className="w-4 h-4" />
-                Informe rápido
-              </button>
-              <button
-                onClick={() => generarInforme(true)}
-                disabled={loading || sorted.length === 0 || generandoInforme}
-                title="Consulta el Caudal de cada estación en la DGA — puede tardar bastante"
-                className="flex items-center gap-2 px-4 py-2.5 rounded-md border border-[#2A4038] text-[#DCE7E3] hover:text-white hover:border-[#3B8FA3]/60 text-[14px] font-semibold transition-colors disabled:opacity-50"
-              >
-                <FileText className="w-4 h-4" />
-                Informe con Caudal
+                Generar informe
               </button>
               <button
                 onClick={refresh}
@@ -1049,6 +1054,7 @@ export default function CentroMando() {
           copiado={informeCopiado}
           onCopiar={copiarInforme}
           onClose={() => setInformeTexto(null)}
+          segDemorado={informeSegDemorado}
         />
       )}
       </>
@@ -2037,7 +2043,7 @@ function TendenciaNacionalDialog({ corridas, onClose }) {
 // pegar donde haga falta (Instagram, WhatsApp, etc.). El texto se
 // selecciona completo con un click en el área (además del botón Copiar),
 // para cubrir navegadores donde el acceso al portapapeles esté bloqueado.
-function InformeDialog({ texto, copiado, onCopiar, onClose }) {
+function InformeDialog({ texto, copiado, onCopiar, onClose, segDemorado }) {
   useEffect(() => {
     function onKey(e) { if (e.key === "Escape") onClose(); }
     window.addEventListener("keydown", onKey);
@@ -2069,6 +2075,11 @@ function InformeDialog({ texto, copiado, onCopiar, onClose }) {
           <div>
             <h2 className="font-display font-bold text-2xl text-white leading-tight">Informe generado</h2>
             <p className="text-[13px] font-medium text-[#C7D3CE] mt-1">Copia el texto y pegalo donde lo necesites</p>
+            {segDemorado != null && (
+              <p className="font-mono text-[11px] text-[#5C726A] mt-1.5">
+                Generado en {segDemorado}s
+              </p>
+            )}
           </div>
           <button onClick={onClose} className="p-2 rounded-md text-[#9BAEA8] hover:text-[#EDF2F0] hover:bg-[#1E332C] transition-colors flex-shrink-0">
             <X className="w-5 h-5" />
