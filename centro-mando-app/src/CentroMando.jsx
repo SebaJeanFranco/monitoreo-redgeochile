@@ -380,28 +380,37 @@ export default function CentroMando() {
   const [tendenciaExpandida, setTendenciaExpandida] = useState(false);
 
   // Generador de informe de texto (agrupado por región, listo para
-  // copiar/pegar). A diferencia de la carga básica del panorama general,
-  // el informe SÍ incluye Caudal — y como el Caudal solo existe pidiéndolo
-  // estación por estación a la DGA (ver /caudal en worker.js, no hay forma
-  // de traerlo en lote), generar el informe dispara una consulta en serie
-  // a todas las estaciones Roja/Amarilla que todavía no lo tengan. Por eso
-  // el botón bloquea toda la pantalla con progreso mientras dura — puede
-  // tardar bastante (varios segundos por estación) según cuántas alertas
-  // haya en el momento.
+  // copiar/pegar). Dos versiones separadas: rápida (solo con lo que ya
+  // hay en memoria, sin Caudal) y con Caudal (consulta la DGA estación
+  // por estación para las Roja/Amarilla que todavía no lo tengan). Se
+  // separaron en dos botones para que nadie dispare sin querer la versión
+  // lenta pensando que iba a ser instantánea.
   const [informeTexto, setInformeTexto] = useState(null);
   const [generandoInforme, setGenerandoInforme] = useState(false);
   const [informeCopiado, setInformeCopiado] = useState(false);
-  const [progresoInforme, setProgresoInforme] = useState({ hechas: 0, total: 0, estimadoSegRestantes: 0 });
+  const [progresoInforme, setProgresoInforme] = useState({ hechas: 0, total: 0, segTranscurridos: 0 });
 
-  // Tiempo promedio real por estación consultada (ver DETALLE_DELAY_MS +
-  // duración de la petición en worker.js) — usado solo para el estimado
-  // de "tiempo restante" que se muestra en pantalla, no afecta el ritmo
-  // real de las peticiones.
-  const SEG_ESTIMADO_POR_ESTACION = 1.3;
-
-  async function generarInforme() {
+  async function generarInforme(conCaudal) {
     setGenerandoInforme(true);
     setInformeCopiado(false);
+    setProgresoInforme({ hechas: 0, total: 0, segTranscurridos: 0 });
+
+    if (!conCaudal) {
+      // Versión rápida: nada que pedir, el texto sale directo de lo que
+      // ya está cargado en `sorted`.
+      const texto = generarInformeTexto(sorted, data?.generadoEn);
+      setInformeTexto(texto);
+      setGenerandoInforme(false);
+      return;
+    }
+
+    const inicio = Date.now();
+    // Cronómetro visible mientras dura la consulta — muestra tiempo
+    // REAL transcurrido (no un estimado), ya que el tiempo por estación
+    // varía según cuánto tarde la DGA en responder cada una.
+    const cronometro = setInterval(() => {
+      setProgresoInforme(prev => ({ ...prev, segTranscurridos: Math.round((Date.now() - inicio) / 1000) }));
+    }, 250);
 
     // Estaciones que necesitan Caudal para el informe: Roja y Amarilla
     // únicamente (mismo criterio que el resto del dashboard — Azul nunca
@@ -417,7 +426,7 @@ export default function CentroMando() {
     }
     const faltantes = elegibles.filter(s => !caudalPorCodigo.has(s.codigo));
 
-    setProgresoInforme({ hechas: 0, total: faltantes.length, estimadoSegRestantes: Math.round(faltantes.length * SEG_ESTIMADO_POR_ESTACION) });
+    setProgresoInforme({ hechas: 0, total: faltantes.length, segTranscurridos: 0 });
 
     // En serie, no en paralelo — mismo motivo que fetchDetalleEnLotes() en
     // el Worker: el servidor JSF de la DGA pisa el ViewState cuando llegan
@@ -432,9 +441,10 @@ export default function CentroMando() {
         // simplemente queda sin Caudal en el texto final, igual que ya
         // maneja el resto del dashboard cuando la DGA no responde.
       }
-      const restantes = faltantes.length - (i + 1);
-      setProgresoInforme({ hechas: i + 1, total: faltantes.length, estimadoSegRestantes: Math.round(restantes * SEG_ESTIMADO_POR_ESTACION) });
+      setProgresoInforme(prev => ({ ...prev, hechas: i + 1, total: faltantes.length }));
     }
+
+    clearInterval(cronometro);
 
     // Estaciones enriquecidas con el Caudal recién obtenido, para pasarle
     // al generador de texto — no se pisa `sorted` ni `caudalPorEstacion`
@@ -717,14 +727,24 @@ export default function CentroMando() {
               </p>
             </div>
 
-            <div className="flex-1 flex justify-end gap-2.5">
+            <div className="flex-1 flex justify-end gap-2.5 flex-wrap">
               <button
-                onClick={generarInforme}
+                onClick={() => generarInforme(false)}
                 disabled={loading || sorted.length === 0 || generandoInforme}
+                title="Informe instantáneo, sin Caudal"
                 className="flex items-center gap-2 px-4 py-2.5 rounded-md border border-[#2A4038] text-[#DCE7E3] hover:text-white hover:border-[#3B8FA3]/60 text-[14px] font-semibold transition-colors disabled:opacity-50"
               >
                 <FileText className="w-4 h-4" />
-                Generar informe
+                Informe rápido
+              </button>
+              <button
+                onClick={() => generarInforme(true)}
+                disabled={loading || sorted.length === 0 || generandoInforme}
+                title="Consulta el Caudal de cada estación en la DGA — puede tardar bastante"
+                className="flex items-center gap-2 px-4 py-2.5 rounded-md border border-[#2A4038] text-[#DCE7E3] hover:text-white hover:border-[#3B8FA3]/60 text-[14px] font-semibold transition-colors disabled:opacity-50"
+              >
+                <FileText className="w-4 h-4" />
+                Informe con Caudal
               </button>
               <button
                 onClick={refresh}
@@ -904,11 +924,12 @@ export default function CentroMando() {
         />
       )}
 
-      {/* Bloqueo de pantalla completa mientras se arma el informe — pide
-          Caudal en serie a la DGA para cada estación Roja/Amarilla que
-          todavía no lo tenga (ver generarInforme), así que puede tardar
-          bastante según cuántas alertas haya. La barra de progreso y el
-          estimado le dan al usuario una idea de cuánto falta, en vez de
+      {/* Bloqueo de pantalla completa mientras se arma el informe con
+          Caudal — pide Caudal en serie a la DGA para cada estación
+          Roja/Amarilla que todavía no lo tenga (ver generarInforme), así
+          que puede tardar bastante según cuántas alertas haya. La barra
+          de progreso y el cronómetro (tiempo REAL transcurrido, no un
+          estimado) le dan al usuario una idea de cuánto lleva, en vez de
           solo un spinner indefinido. No se puede cerrar ni interactuar
           con nada detrás mientras está activo. */}
       {generandoInforme && (
@@ -936,9 +957,7 @@ export default function CentroMando() {
                 />
               </div>
               <p className="font-mono text-[11px] text-[#7C8F88] mt-2 text-center">
-                {progresoInforme.estimadoSegRestantes > 0
-                  ? `Tiempo estimado restante: ~${progresoInforme.estimadoSegRestantes}s`
-                  : "Ya casi..."}
+                Tiempo transcurrido: {progresoInforme.segTranscurridos}s
               </p>
             </div>
           )}
