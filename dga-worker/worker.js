@@ -329,7 +329,20 @@ function sleep(ms) {
 // EN SERIE (una a la vez), no en paralelo — ver la nota larga en
 // fetchDetalleEnLotes() más abajo sobre por qué se intentó paralelizar y
 // tuvo que revertirse.
-const DETALLE_DELAY_MS = 700;
+//
+// Bajado de 700ms a 350ms para acelerar el informe con Caudal (antes
+// ~40-50s para 27 estaciones, solo de pausas). La causa raíz del límite
+// original era la CONCURRENCIA (varias peticiones al mismo tiempo pisando
+// el ViewState compartido), no la velocidad en sí — en serie con menos
+// pausa entre una y la siguiente no debería reproducir ese problema,
+// porque cada petición sigue esperando a que la anterior termine del todo
+// antes de arrancar. Si en el uso real empiezan a aparecer más mensajes
+// "sin ninguna variable esperada" en la hoja LOG (ver requestStationDetail
+// más abajo) de los que había antes, es señal de que 350ms quedó
+// demasiado agresivo y conviene subirlo de nuevo — la hoja LOG es
+// justamente la forma de confirmar esto con datos reales en vez de
+// adivinar.
+const DETALLE_DELAY_MS = 350;
 
 async function fetchDetalleEnLotes(stations, viewState, cookie, logger) {
   // Nota histórica importante: esta función se llamó "EnLotes" porque en un

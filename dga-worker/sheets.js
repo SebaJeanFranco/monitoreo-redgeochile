@@ -394,18 +394,26 @@ export function findLatestPreviousByCode(allRows, codigos) {
     byCode.get(row.codigo).push(row);
   }
 
+  // Ventana de "es la misma corrida actual, no una anterior real": si el
+  // cron acaba de guardar un snapshot en los últimos 5 minutos, es
+  // prácticamente seguro que sea la misma lectura que se está mostrando
+  // ahora mismo (el cron corre cada 30 min) — comparar contra esa fila
+  // da 0% de diferencia siempre y hace que la estación parezca "estable"
+  // cuando en realidad no hay comparación real todavía. Se descarta esa
+  // fila y se busca la anterior a ella.
+  const MARGEN_MISMA_CORRIDA_MS = 5 * 60 * 1000;
+  const ahora = Date.now();
+
   const result = new Map();
   for (const [codigo, rows] of byCode.entries()) {
     // Más reciente primero
     rows.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
-    // rows[0] es la corrida más reciente del cron — el punto de
-    // comparación correcto. Si no hay ninguna fila todavía para esta
-    // estación (el cron nunca corrió, o esta estación nunca estuvo en
-    // alerta antes), no hay nada con qué comparar — se deja sin entrada
-    // en el Map, y calcularTendencia() ya maneja ese caso devolviendo
-    // null.
-    if (rows.length >= 1) {
-      result.set(codigo, rows[0]);
+    // Se busca la primera fila que NO esté dentro del margen de "recién
+    // guardada ahora" — así se compara contra una corrida genuinamente
+    // anterior, no contra el mismo dato que se está mostrando.
+    const previa = rows.find(r => ahora - new Date(r.timestamp).getTime() > MARGEN_MISMA_CORRIDA_MS);
+    if (previa) {
+      result.set(codigo, previa);
     }
   }
   return result;
@@ -441,4 +449,33 @@ export function resumenPorCorrida(allRows) {
     if (entry[r.tipoAlerta] != null) entry[r.tipoAlerta]++;
   }
   return [...porTimestamp.values()].sort((a, b) => (a.timestamp || "").localeCompare(b.timestamp || ""));
+}
+
+// Mismo resumen que resumenPorCorrida(), pero separado por región — para
+// cada región, su propia serie de corridas con total + desglose por
+// color. Se usa para calcular la variación de cada región del panorama
+// general ("+3 desde hace 30 min" por región, no solo a nivel nacional).
+// Reusa las mismas filas que ya trajo readAllSnapshotRows (regionNombreAprox
+// ya viene en cada fila, columna H de la hoja DATOS) — no hace falta una
+// lectura extra a Sheets.
+export function resumenPorRegionYCorrida(allRows) {
+  const porRegion = new Map();
+  for (const r of allRows) {
+    if (!r.timestamp) continue;
+    const region = r.regionNombreAprox || "Región no identificada";
+    if (!porRegion.has(region)) porRegion.set(region, new Map());
+    const porTimestamp = porRegion.get(region);
+    if (!porTimestamp.has(r.timestamp)) {
+      porTimestamp.set(r.timestamp, { timestamp: r.timestamp, total: 0, Roja: 0, Amarilla: 0, Azul: 0 });
+    }
+    const entry = porTimestamp.get(r.timestamp);
+    entry.total++;
+    if (entry[r.tipoAlerta] != null) entry[r.tipoAlerta]++;
+  }
+
+  const resultado = {};
+  for (const [region, porTimestamp] of porRegion.entries()) {
+    resultado[region] = [...porTimestamp.values()].sort((a, b) => (a.timestamp || "").localeCompare(b.timestamp || ""));
+  }
+  return resultado;
 }
