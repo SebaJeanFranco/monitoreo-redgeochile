@@ -124,6 +124,58 @@ async function getAccessToken(env) {
   return cachedToken;
 }
 
+// Cabecera de columnas de la hoja "DATOS" — mismo orden que arma
+// appendSnapshotRows() más abajo. Se define una sola vez acá para que
+// ambas puntas (qué se escribe y qué dice la cabecera) no se desalineen.
+const HEADER_ROW = [
+  "timestamp", "codigo", "nombre", "tipoAlerta",
+  "nivelAlerta", "valorMedicion", "umbral", "regionNombreAprox",
+];
+
+// Cachea en memoria del propio Worker si ya se confirmó que la cabecera
+// está puesta, para no consultar A1 en cada corrida del cron una vez que
+// ya se sabe que está bien.
+let headerConfirmed = false;
+
+// Se fija si A1:H1 ya tiene la cabecera puesta; si está vacía (hoja nueva)
+// o tiene otra cosa, escribe HEADER_ROW ahí. Usa `update` (PUT) apuntando
+// directo a la fila 1 — así siempre queda ahí sin desplazar los datos que
+// ya haya debajo, y nunca se duplica con sucesivas corridas del cron.
+async function ensureHeaderRow(env, token, sheetId) {
+  if (headerConfirmed) return;
+
+  const range = "DATOS!A1:H1";
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}`;
+  const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Google Sheets lectura de cabecera falló (HTTP ${resp.status}): ${text}`);
+  }
+  const data = await resp.json();
+  const currentFirstRow = (data.values && data.values[0]) || [];
+  const yaTieneCabecera = HEADER_ROW.every((h, i) => currentFirstRow[i] === h);
+
+  if (yaTieneCabecera) {
+    headerConfirmed = true;
+    return;
+  }
+
+  const putUrl = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}?valueInputOption=RAW`;
+  const putResp = await fetch(putUrl, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ values: [HEADER_ROW] }),
+  });
+  if (!putResp.ok) {
+    const text = await putResp.text();
+    throw new Error(`Google Sheets escritura de cabecera falló (HTTP ${putResp.status}): ${text}`);
+  }
+  headerConfirmed = true;
+}
+
 // ---------------------------------------------------------------------------
 // Escritura: agrega filas al final de la hoja "DATOS" (una fila por
 // estación por corrida del cron). Usa el endpoint `:append` de la API de
@@ -135,6 +187,18 @@ export async function appendSnapshotRows(env, stations) {
   if (!sheetId) throw new Error("Falta el secret GOOGLE_SHEET_ID.");
 
   const token = await getAccessToken(env);
+
+  // Antes de agregar filas, asegura que la fila 1 tenga la cabecera — así
+  // el append de abajo siempre cae debajo de un título, nunca mezclado con
+  // datos crudos como en la captura que motivó este cambio. Si esto falla
+  // (p.ej. problema puntual de permisos), no debe frenar el guardado del
+  // snapshot en sí — se deja constancia y se sigue con el append normal.
+  try {
+    await ensureHeaderRow(env, token, sheetId);
+  } catch (e) {
+    console.error("[sheets] No se pudo confirmar/escribir la cabecera:", e.message || e);
+  }
+
   const timestamp = new Date().toISOString();
 
   // Una fila por estación: [timestamp, codigo, nombre, tipoAlerta,
@@ -194,7 +258,14 @@ export async function readAllSnapshotRows(env) {
   }
 
   const data = await resp.json();
-  const rows = data.values || [];
+  let rows = data.values || [];
+  // La fila 1 puede ser la cabecera (["timestamp","codigo",...], ver
+  // ensureHeaderRow) — si está, se descarta acá para que no se procese
+  // como si fuera una lectura real (rompería Number() en las columnas
+  // numéricas, ya que "valorMedicion" no es un número válido).
+  if (rows.length > 0 && rows[0][0] === HEADER_ROW[0] && rows[0][1] === HEADER_ROW[1]) {
+    rows = rows.slice(1);
+  }
   // [timestamp, codigo, nombre, tipoAlerta, nivelAlerta, valorMedicion, umbral, region]
   return rows.map(r => ({
     timestamp: r[0],
