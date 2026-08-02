@@ -545,7 +545,7 @@ export default function CentroMando() {
       setError(
         WORKER_URL
           ? `No se pudo conectar con el Worker (${e.message}). Verificá que esté desplegado: ver dga-worker/README.md.`
-          : "No se encontró alertas-rios.json y no hay un Worker configurado (VITE_DGA_WORKER_URL). Corré scripts/fetch_alertas_dga.py, o desplegá dga-worker/ para actualización automática."
+          : "No se encontró alertas-rios.json y no hay un Worker configurado (VITE_DGA_WORKER_URL). Corre scripts/fetch_alertas_dga.py, o despliega dga-worker/ para actualización automática."
       );
     } finally {
       setLoading(false);
@@ -1123,7 +1123,7 @@ function CategoryButton({ styleKey, label, count, active, blocked, onClick }) {
       </p>
       {!disabled && (
         <p className="font-mono text-[11px] text-[#7C8F88] mt-3">
-          {active ? "Tocá para cerrar ↑" : "Tocá para ver detalle →"}
+          {active ? "Toca para cerrar ↑" : "Toca para ver detalle →"}
         </p>
       )}
       {blocked && active && (
@@ -1538,7 +1538,7 @@ function StationDialog({ station, estacionesCategoria, onClose, onOpenStation, o
                   <div className="flex items-start gap-2 rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-3">
                     <Radio className="w-3.5 h-3.5 text-[#7C8F88] flex-shrink-0 mt-0.5" />
                     <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
-                      Sin datos de Caudal/Precipitación — corré el script con <code className="text-[#7ECBDE] font-mono">--detalle</code> para incluirlos, o configurá <code className="text-[#7ECBDE] font-mono">VITE_DGA_WORKER_URL</code> para pedirlo bajo demanda.
+                      Sin datos de Caudal/Precipitación — corre el script con <code className="text-[#7ECBDE] font-mono">--detalle</code> para incluirlos, o configura <code className="text-[#7ECBDE] font-mono">VITE_DGA_WORKER_URL</code> para pedirlo bajo demanda.
                     </p>
                   </div>
                 ) : station.caudalEstado?.loading ? (
@@ -1654,7 +1654,7 @@ function HistoricoChart({ puntos, loading, error, umbral, unidad, colorClass }) 
     return (
       <div className="rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-3">
         <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
-          Todavía no hay suficiente histórico guardado para graficar esta estación — el cron guarda una lectura cada 30 min, volvé a revisar más tarde.
+          Todavía no hay suficiente histórico guardado para graficar esta estación — el cron guarda una lectura cada 30 min, vuelve a revisar más tarde.
         </p>
       </div>
     );
@@ -1928,7 +1928,7 @@ function TendenciaNacionalChart({ corridas, error, onExpand }) {
     return (
       <div className="rounded-lg bg-[#0F1B18] border border-[#1E332C] px-4 py-3">
         <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
-          Todavía no hay suficiente histórico guardado para mostrar la tendencia — el cron guarda una corrida cada 30 min, volvé a revisar más tarde.
+          Todavía no hay suficiente histórico guardado para mostrar la tendencia — el cron guarda una corrida cada 30 min, vuelve a revisar más tarde.
         </p>
       </div>
     );
@@ -1970,7 +1970,7 @@ function TendenciaNacionalChart({ corridas, error, onExpand }) {
       >
         <TendenciaSVG enVentana={enVentana} seriesVisibles={seriesVisibles} height={140} />
         <p className="text-[10px] font-mono text-[#5C726A] mt-1 text-right group-hover:text-[#7ECBDE] transition-colors">
-          Tocá el gráfico para ampliar →
+          Toca el gráfico para ampliar →
         </p>
       </button>
     </div>
@@ -2017,7 +2017,7 @@ function TendenciaNacionalDialog({ corridas, onClose }) {
         <div className="px-8 py-6">
           {!suficientesDatos && (
             <p className="text-[13px] text-[#9BAEA8] leading-relaxed">
-              Todavía no hay suficiente histórico guardado para esta ventana — el cron guarda una corrida cada 30 min, volvé a revisar más tarde.
+              Todavía no hay suficiente histórico guardado para esta ventana — el cron guarda una corrida cada 30 min, vuelve a revisar más tarde.
             </p>
           )}
           {suficientesDatos && (
@@ -2068,7 +2068,7 @@ function InformeDialog({ texto, copiado, onCopiar, onClose }) {
         <div className="flex items-start justify-between gap-4 px-8 py-6 border-b border-[#1E332C]">
           <div>
             <h2 className="font-display font-bold text-2xl text-white leading-tight">Informe generado</h2>
-            <p className="text-[13px] font-medium text-[#C7D3CE] mt-1">Copiá el texto y pegalo donde lo necesites</p>
+            <p className="text-[13px] font-medium text-[#C7D3CE] mt-1">Copia el texto y pegalo donde lo necesites</p>
           </div>
           <button onClick={onClose} className="p-2 rounded-md text-[#9BAEA8] hover:text-[#EDF2F0] hover:bg-[#1E332C] transition-colors flex-shrink-0">
             <X className="w-5 h-5" />
