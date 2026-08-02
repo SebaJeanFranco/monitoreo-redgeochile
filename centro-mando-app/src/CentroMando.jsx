@@ -532,6 +532,12 @@ function StationDialog({ station, onClose }) {
 
   const s = ALERT_STYLES[station.tipoAlerta] || ALERT_STYLES.Azul;
   const d = station.detalle;
+  // El objeto `detalle` puede existir pero con sus 5 campos en null (la DGA
+  // consultó la estación pero no reportó ningún valor) — eso es distinto a
+  // que `detalle` no exista en absoluto (nunca se pidió, o falló la
+  // petición). hayAlgunDetalle distingue ambos casos para mostrar un
+  // mensaje preciso en vez de una grilla vacía y silenciosa.
+  const hayAlgunDetalle = d && [d.caudalM3s, d.precipitacion24hMm, d.precipitacionAcumMm, d.alturaNieveCm, d.volumenLagoMillM3].some(v => v != null);
 
   const facts = [
     { label: "Estado de transmisión", value: station.estadoTransmision },
@@ -604,7 +610,7 @@ function StationDialog({ station, onClose }) {
           </div>
 
           {/* Caudal / Precipitación / Nieve / Volumen — solo si el JSON se generó con --detalle */}
-          {d && (
+          {d && hayAlgunDetalle && (
             <div className="grid grid-cols-2 gap-2.5 mb-4">
               {d.caudalM3s != null && <Stat label="Caudal" value={d.caudalM3s} unit="m³/seg" />}
               {d.precipitacion24hMm != null && <Stat label="Pptación últimas 24h" value={d.precipitacion24hMm} unit="mm" />}
@@ -613,13 +619,15 @@ function StationDialog({ station, onClose }) {
               {d.volumenLagoMillM3 != null && <Stat label="Volumen de lago" value={d.volumenLagoMillM3} unit="Mill.m³" />}
             </div>
           )}
-          {!d && (
+          {(!d || !hayAlgunDetalle) && (
             <div className="flex items-start gap-2 rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-3 mb-4">
               <Radio className="w-3.5 h-3.5 text-[#7C8F88] flex-shrink-0 mt-0.5" />
               <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
                 {station.tipoAlerta === "Azul"
                   ? "Esta estación está en alerta Azul — el Caudal solo se calcula para alertas Roja y Amarilla, para mantener la carga rápida."
-                  : <>Sin datos de Caudal/Precipitación — corré el script con <code className="text-[#7ECBDE] font-mono">--detalle</code> para incluirlos.</>}
+                  : d
+                    ? "La DGA consultó esta estación pero no reportó Caudal ni Precipitación — es posible que no tenga esos sensores instalados."
+                    : <>Sin datos de Caudal/Precipitación — corré el script con <code className="text-[#7ECBDE] font-mono">--detalle</code> para incluirlos.</>}
               </p>
             </div>
           )}
