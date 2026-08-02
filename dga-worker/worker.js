@@ -14,10 +14,38 @@
  * leerla.
  *
  * Endpoints:
- *   GET /alertas             → alertas básicas, rápido (~2-3s)
- *   GET /alertas?detalle=1   → incluye Caudal/Precipitación (~15-25s,
- *                               una petición extra por estación en alerta)
+ *   GET /alertas                        → alertas básicas de TODAS las
+ *                                           categorías, rápido (~2-3s), sin
+ *                                           Caudal. Pensado para la pantalla
+ *                                           inicial del dashboard (conteos
+ *                                           + mapa general).
+ *   GET /alertas?detalle=1              → incluye Caudal/Precipitación de
+ *                                           Roja+Amarilla juntas (comporta-
+ *                                           miento histórico, sin ?color=).
+ *   GET /alertas?detalle=1&color=Roja   → incluye Caudal SOLO de esa
+ *   GET /alertas?detalle=1&color=Amarilla  categoría (Roja/Amarilla/Azul).
+ *   GET /alertas?detalle=1&color=Azul      Pensado para el flujo de "3
+ *                                           botones grandes" del dashboard:
+ *                                           el detalle se pide recién
+ *                                           cuando el usuario abre esa
+ *                                           categoría específica.
+ *
+ * Todas las peticiones de detalle van EN SERIE (una a la vez, no en
+ * paralelo) — ver la nota larga en fetchDetalleEnLotes() sobre la
+ * condición de carrera que causaba paralelizarlas.
+ *
+ * Histórico y tendencia (Google Sheets): un Cron Trigger (ver
+ * wrangler.toml) ejecuta scheduled() cada 30 minutos, SIN que ningún
+ * usuario visite la web — guarda un snapshot de Nivel de Agua de todas las
+ * estaciones en alerta en una Google Sheet (ver sheets.js). Cuando el
+ * dashboard pide el detalle de una categoría, el Worker además lee esa
+ * Sheet y le agrega a cada estación un campo `tendencia` con la
+ * comparación contra su lectura anterior — así el usuario puede ver
+ * "subió 8% en 30 min" sin que el navegador tenga que saber nada de
+ * Sheets ni de credenciales.
  */
+
+import { appendSnapshotRows, readAllSnapshotRows, findLatestPreviousByCode } from "./sheets.js";
 
 const SNIA_URL = "https://snia.mop.gob.cl/sat/site/informes/mapas/mapas.xhtml";
 
@@ -44,11 +72,15 @@ const BROWSER_HEADERS = {
 };
 
 // Límite de estaciones a las que se les pide detalle en una sola ejecución.
-// Protege contra timeouts del Worker si algún día hay muchísimas alertas a
-// la vez. Con 20 estaciones y ~1s de pausa entre cada una, el peor caso
-// ronda los 20-25s, dentro del límite de duración de un Worker gratuito.
-const MAX_DETALLE_STATIONS = 20;
-const DETALLE_DELAY_MS = 900;
+// Protege contra timeouts del Worker si algún día hay muchísimas alertas de
+// una categoría a la vez. Las peticiones son EN SERIE (~0.7-1s cada una,
+// ver DETALLE_DELAY_MS más abajo), así que 30 estaciones son ~20-30s en el
+// peor caso — el límite de tiempo de un Worker de Cloudflare da margen de
+// sobra para eso. Se subió de 20 a 30 respecto a la versión anterior porque
+// ahora el detalle se pide por categoría (?color=Roja/Amarilla/Azul) en vez
+// de Roja+Amarilla combinadas, y Azul sola puede superar fácilmente las 20
+// estaciones en un día con muchas alertas menores.
+const MAX_DETALLE_STATIONS = 30;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -116,7 +148,7 @@ function normalizeStation(s) {
     unidad: (s.parametro?.glsUnidad || "").trim() || null,
     parametro: (s.parametro?.glsParametro || "").trim() || null,
     fuenteEstacion: s.fuenteEstacion ?? null,
-    tipoEstacion: s.tipoEstacion ?? null,
+    tipoEstacion: (s.tipoEstacion ?? "").trim() || null,
     fecha: s.fecha ?? null,
     regionCodigo: regionCode,
     regionNombreAprox: REGION_NAMES[regionCode] || `Región ${regionCode}`,
@@ -191,7 +223,7 @@ async function getViewState() {
   return { viewState: match[1], cookie };
 }
 
-async function fetchStationDetail(viewState, cookie, codigo, tipoEstacion) {
+async function requestStationDetail(viewState, cookie, codigo, param2) {
   const body = new URLSearchParams({
     "medicionesByTypeFunctions": "medicionesByTypeFunctions",
     "javax.faces.ViewState": viewState,
@@ -199,7 +231,7 @@ async function fetchStationDetail(viewState, cookie, codigo, tipoEstacion) {
     "javax.faces.partial.execute": "medicionesByTypeFunctions:j_idt162 @component",
     "javax.faces.partial.render": "@component",
     "param1": codigo,
-    "param2": tipoEstacion || "",
+    "param2": param2 || "",
     "org.richfaces.ajax.component": "medicionesByTypeFunctions:j_idt162",
     "medicionesByTypeFunctions:j_idt162": "medicionesByTypeFunctions:j_idt162",
     "AJAX:EVENTS_COUNT": "1",
@@ -217,7 +249,6 @@ async function fetchStationDetail(viewState, cookie, codigo, tipoEstacion) {
   if (cookie) headers["Cookie"] = cookie;
 
   const resp = await fetch(SNIA_URL, { method: "POST", headers, body: body.toString() });
-
   if (!resp.ok) return null;
   const text = await resp.text();
 
@@ -231,13 +262,130 @@ async function fetchStationDetail(viewState, cookie, codigo, tipoEstacion) {
   return anyFound ? result : null;
 }
 
+// Envoltorio con reintento. Se observó que algunas estaciones devuelven
+// TODOS los campos de detalle en null en el primer intento (ej. "RIO
+// CHOLCHOL EN CHOLCHOL", que sí tiene Caudal real en el sitio oficial),
+// mientras que otras con tipoEstacion "simple" funcionan a la primera. La
+// sospecha es que el servidor de la DGA hace una comparación exacta de
+// string contra param2 (tipoEstacion) y algunas combinaciones largas o con
+// variaciones de formato no calzan. En vez de perseguir cada caso de
+// formato uno por uno, si el primer intento no trae ningún dato, se
+// reintenta una vez sin param2 (vacío) — que en las capturas de red
+// originales no siempre resultó estrictamente necesario para que el
+// servidor identifique la estación por su código.
+async function fetchStationDetail(viewState, cookie, codigo, tipoEstacion) {
+  const first = await requestStationDetail(viewState, cookie, codigo, tipoEstacion);
+  if (first != null) return first;
+  return requestStationDetail(viewState, cookie, codigo, "");
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function handleAlertas(url) {
+// Pausa entre peticiones de detalle. IMPORTANTE: estas peticiones se hacen
+// EN SERIE (una a la vez), no en paralelo — ver la nota larga en
+// fetchDetalleEnLotes() más abajo sobre por qué se intentó paralelizar y
+// tuvo que revertirse.
+const DETALLE_DELAY_MS = 700;
+
+async function fetchDetalleEnLotes(stations, viewState, cookie) {
+  // Nota histórica importante: esta función se llamó "EnLotes" porque en un
+  // momento pedía el detalle de varias estaciones EN PARALELO (lotes de 5,
+  // con Promise.allSettled) para acelerar la carga de ~20-25s a ~5-8s. Se
+  // revirtió a secuencial tras confirmar con datos reales de producción que
+  // la paralelización introducía un bug de datos, no solo un problema de
+  // velocidad:
+  //
+  // Se analizaron 16 estaciones Roja/Amarilla en una respuesta real: 10 de
+  // 16 volvían con TODOS los campos de detalle en null, sin ningún patrón
+  // por región, código de estación, ni tipoEstacion (la misma estación con
+  // el mismo tipoEstacion "Fluviometricas" a veces traía el dato y a veces
+  // no). Lo único que explicaba el patrón era la posición de cada estación
+  // dentro de su lote de 5 peticiones simultáneas — y esa posición ganadora
+  // cambiaba de un lote a otro sin ningún orden fijo.
+  //
+  // La explicación técnica: el servidor de la DGA usa JSF/RichFaces, un
+  // framework donde el javax.faces.ViewState representa el estado de UNA
+  // vista de servidor en un momento dado. Cuando 5 peticiones AJAX llegan
+  // casi al mismo tiempo compartiendo el mismo ViewState y la misma cookie
+  // de sesión, el servidor las procesa como si fueran ediciones concurrentes
+  // sobre el mismo estado — no está diseñado para eso. La petición que
+  // "gana la carrera" en el servidor devuelve el dato real; el resto recibe
+  // una respuesta de un estado ya pisado/inválido, que nuestro código
+  // interpreta correctamente como "sin datos" (por eso vuelve null en vez
+  // de un error o un dato incorrecto — RichFaces no rompe, solo no entrega
+  // nada útil).
+  //
+  // La única forma confiable de evitar la condición de carrera es no crear
+  // la carrera: pedir el detalle de una estación a la vez, esperando a que
+  // la respuesta completa vuelva antes de pedir la siguiente. Es lo que
+  // hace este bucle. Vuelve a ser más lento (~15-20s para 20 estaciones en
+  // vez de ~5-8s), pero es la diferencia entre datos correctos y datos
+  // silenciosamente incorrectos — para un panel de alertas de crecidas de
+  // ríos, esa prioridad no es negociable.
+  for (let i = 0; i < stations.length; i++) {
+    const s = stations[i];
+    try {
+      s.detalle = await fetchStationDetail(viewState, cookie, s.codigo, s.tipoEstacion);
+    } catch (e) {
+      // Fallo de red/excepción real (timeout, conexión cortada, etc.) — no
+      // el caso de "respuesta vacía sin error" que ya maneja el reintento
+      // de param2 dentro de fetchStationDetail(). Un solo reintento extra
+      // acá cubre errores transitorios puntuales sin alargar demasiado el
+      // resto de la carga si es un fallo persistente.
+      try {
+        s.detalle = await fetchStationDetail(viewState, cookie, s.codigo, s.tipoEstacion);
+      } catch (e2) {
+        s.detalle = null;
+      }
+    }
+    if (i < stations.length - 1) await sleep(DETALLE_DELAY_MS);
+  }
+}
+
+const COLORES_VALIDOS = ["Roja", "Amarilla", "Azul"];
+
+// Compara la lectura actual de una estación contra su snapshot anterior
+// guardado en Sheets (si existe) y arma un objeto simple que el dashboard
+// puede mostrar directo: "subió/bajó/estable" + el % de cambio + hace
+// cuánto fue esa lectura anterior. Si no hay snapshot previo (primera vez
+// que esta estación aparece en el histórico), devuelve null — el
+// dashboard debe manejar la ausencia de tendencia sin problema, no todos
+// los casos van a tener con qué comparar.
+function calcularTendencia(estacionActual, snapshotPrevio) {
+  if (!snapshotPrevio || snapshotPrevio.valorMedicion == null || estacionActual.valorMedicion == null) {
+    return null;
+  }
+  const actual = estacionActual.valorMedicion;
+  const previo = snapshotPrevio.valorMedicion;
+  const diferencia = actual - previo;
+  // Umbral pequeño para "estable": diferencias de redondeo/ruido de sensor
+  // no deberían anunciarse como "subiendo" o "bajando".
+  const direccion = Math.abs(diferencia) < 0.01 ? "estable" : diferencia > 0 ? "subiendo" : "bajando";
+  const porcentaje = previo !== 0 ? (diferencia / previo) * 100 : null;
+
+  return {
+    direccion,
+    diferenciaMetros: Math.round(diferencia * 100) / 100,
+    porcentaje: porcentaje != null ? Math.round(porcentaje * 10) / 10 : null,
+    valorAnterior: previo,
+    tipoAlertaAnterior: snapshotPrevio.tipoAlerta,
+    timestampAnterior: snapshotPrevio.timestamp,
+  };
+}
+
+async function handleAlertas(url, env) {
   const wantDetalle = url.searchParams.get("detalle") === "1";
   const wantAll = url.searchParams.get("all") === "1";
+  // ?color=Roja (o Amarilla/Azul) pide el detalle SOLO de esa categoría —
+  // pensado para el flujo de "3 botones grandes" del dashboard: se pide
+  // detalle únicamente de la categoría que el usuario decidió abrir, no de
+  // todas las Roja+Amarilla de una vez. Si no viene color, se mantiene el
+  // comportamiento anterior (Roja+Amarilla juntas) para no romper llamadas
+  // existentes que no pasen este parámetro.
+  const colorParam = url.searchParams.get("color");
+  const colorFiltro = COLORES_VALIDOS.includes(colorParam) ? [colorParam] : null;
 
   const pageResp = await fetch(SNIA_URL, { headers: BROWSER_HEADERS });
   if (!pageResp.ok) {
@@ -253,23 +401,46 @@ async function handleAlertas(url) {
   const enAlerta = stations.filter(s => s.alerta);
   let outputStations = wantAll ? stations : enAlerta;
 
+  // Sin ?color=, el criterio histórico sigue siendo Roja+Amarilla (Azul
+  // excluida por defecto, ver nota más abajo). Con ?color=, se usa
+  // exactamente esa categoría — incluyendo Azul si se pide explícitamente,
+  // ya que ahí sí tiene sentido: el usuario decidió abrir esa categoría a
+  // propósito, así que ya aceptó el costo de esa consulta.
+  const detalleAplicaA = colorFiltro || ["Roja", "Amarilla"];
+  const elegiblesParaDetalle = outputStations.filter(s => detalleAplicaA.includes(s.tipoAlerta));
+  const sinDetallePorNivel = outputStations.length - elegiblesParaDetalle.length;
+
   if (wantDetalle) {
-    const target = outputStations.slice(0, MAX_DETALLE_STATIONS);
+    const target = elegiblesParaDetalle.slice(0, MAX_DETALLE_STATIONS);
     try {
       const { viewState, cookie } = await getViewState();
-      for (let i = 0; i < target.length; i++) {
-        const s = target[i];
-        try {
-          s.detalle = await fetchStationDetail(viewState, cookie, s.codigo, s.tipoEstacion);
-        } catch (e) {
-          s.detalle = null;
-        }
-        if (i < target.length - 1) await sleep(DETALLE_DELAY_MS);
-      }
+      await fetchDetalleEnLotes(target, viewState, cookie);
     } catch (e) {
       // Si falla obtener el ViewState (p.ej. la DGA cambió el sitio), se
       // sigue devolviendo las alertas básicas sin detalle, en vez de fallar
       // toda la respuesta.
+    }
+
+    // Tendencia contra el histórico de Sheets: solo cuando el usuario abrió
+    // una categoría específica (?color=), que es el único caso donde el
+    // dashboard realmente pide y muestra esto — evita leer Sheets en el
+    // modo histórico Roja+Amarilla combinado, que ya no usa el dashboard
+    // pero se mantiene por compatibilidad.
+    if (colorFiltro) {
+      try {
+        const allRows = await readAllSnapshotRows(env);
+        const codigos = target.map(s => s.codigo);
+        const previos = findLatestPreviousByCode(allRows, codigos);
+        for (const s of target) {
+          const previo = previos.get(s.codigo);
+          s.tendencia = calcularTendencia(s, previo);
+        }
+      } catch (e) {
+        // Si Sheets falla (credenciales, cuota, etc.), no tiene sentido
+        // romper toda la respuesta por un dato secundario — las
+        // estaciones simplemente quedan sin `tendencia`, el dashboard ya
+        // maneja su ausencia sin problema.
+      }
     }
   }
 
@@ -282,12 +453,19 @@ async function handleAlertas(url) {
     soloAlertas: !wantAll,
     incluyeDetalle: wantDetalle,
     detalleLimitadoA: wantDetalle ? MAX_DETALLE_STATIONS : null,
+    // Metadatos para que el dashboard pueda explicarle al usuario por qué
+    // algunas estaciones no tienen Caudal, sin que parezca un dato faltante
+    // por error.
+    detalleCriterio: wantDetalle
+      ? (colorFiltro ? `${colorFiltro[0]} únicamente (por categoría solicitada)` : "Roja y Amarilla únicamente")
+      : null,
+    detalleOmitidoPorNivel: wantDetalle ? sinDetallePorNivel : null,
     estaciones: outputStations,
   };
 }
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
@@ -297,13 +475,20 @@ export default {
     if (url.pathname === "/" || url.pathname === "") {
       return jsonResponse({
         servicio: "Alertas de Ríos DGA — Worker",
-        endpoints: ["/alertas", "/alertas?detalle=1", "/alertas?all=1"],
+        endpoints: [
+          "/alertas",
+          "/alertas?detalle=1",
+          "/alertas?detalle=1&color=Roja",
+          "/alertas?detalle=1&color=Amarilla",
+          "/alertas?detalle=1&color=Azul",
+          "/alertas?all=1",
+        ],
       });
     }
 
     if (url.pathname === "/alertas") {
       try {
-        const data = await handleAlertas(url);
+        const data = await handleAlertas(url, env);
         return jsonResponse(data);
       } catch (e) {
         return jsonResponse({ error: e.message || "Error desconocido" }, 502);
@@ -311,5 +496,38 @@ export default {
     }
 
     return jsonResponse({ error: "Ruta no encontrada" }, 404);
+  },
+
+  // Se invoca automáticamente por el Cron Trigger (ver wrangler.toml),
+  // cada 30 minutos, SIN que ningún usuario visite la web. Guarda un
+  // snapshot de Nivel de Agua de todas las estaciones en alerta en Google
+  // Sheets — es el histórico contra el que se calcula la tendencia cuando
+  // alguien abre una categoría en el dashboard.
+  async scheduled(controller, env, ctx) {
+    try {
+      const pageResp = await fetch(SNIA_URL, { headers: BROWSER_HEADERS });
+      if (!pageResp.ok) {
+        console.error(`[scheduled] No se pudo descargar la página de la DGA: HTTP ${pageResp.status}`);
+        return;
+      }
+      const html = await pageResp.text();
+      const rawStations = extractStations(html);
+      const stations = dedupeStations(rawStations.map(normalizeStation));
+      const enAlerta = stations.filter(s => s.alerta);
+
+      if (enAlerta.length === 0) {
+        console.log("[scheduled] Ninguna estación en alerta — no se escribe nada.");
+        return;
+      }
+
+      await appendSnapshotRows(env, enAlerta);
+      console.log(`[scheduled] Guardadas ${enAlerta.length} filas en Sheets.`);
+    } catch (e) {
+      // El cron no tiene a quién devolverle un error — se deja constancia
+      // en los logs de Cloudflare (visibles en el dashboard del Worker) y
+      // se sigue. Un fallo puntual del cron no debe romper nada del resto
+      // del sistema: la próxima corrida en 30 min lo intenta de nuevo.
+      console.error("[scheduled] Error guardando snapshot:", e.message || e);
+    }
   },
 };

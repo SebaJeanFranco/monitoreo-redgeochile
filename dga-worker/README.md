@@ -64,6 +64,97 @@ wrangler deploy
 ```
 La URL no cambia entre despliegues.
 
+## Histórico y tendencia (Google Sheets)
+
+Además de traer los datos en vivo de la DGA, este Worker guarda un snapshot
+cada 30 minutos en una Google Sheet (vía un Cron Trigger — corre solo, sin
+que nadie visite la web). Cuando el dashboard abre una categoría, el Worker
+compara la lectura actual contra la anterior guardada y calcula si el
+Nivel de Agua está subiendo, bajando, o estable.
+
+### Por qué las credenciales van como Secrets, nunca en el código
+
+`worker.js` y `sheets.js` se suben a GitHub como respaldo — y ese
+repositorio es público. Si las credenciales de Google estuvieran escritas
+en esos archivos, cualquiera con acceso al repo podría usarlas para leer o
+modificar cualquier Sheet compartida con esa cuenta de servicio. Los
+**Secrets de Cloudflare** existen justo para esto: se configuran una vez
+por comando, quedan cifrados del lado de Cloudflare, y el código los lee
+en tiempo de ejecución sin que su valor aparezca nunca en ningún archivo.
+
+### Paso a paso — configurar Sheets desde cero
+
+**1. Crear el proyecto en Google Cloud y habilitar la API**
+- Andá a **https://console.cloud.google.com/**, creá un proyecto nuevo (o
+  usá uno existente).
+- Menú → **APIs y servicios → Biblioteca** → buscá **"Google Sheets API"**
+  → **Habilitar**.
+
+**2. Crear la cuenta de servicio**
+- Menú → **APIs y servicios → Credenciales** → **Crear credenciales →
+  Cuenta de servicio**.
+- Ponele un nombre (ej. `dgaapi`), no hace falta darle ningún rol especial
+  a nivel de proyecto.
+- Entrá a la cuenta creada → pestaña **Claves** → **Agregar clave → Crear
+  clave nueva → JSON**. Se descarga un archivo — **guardalo en un lugar
+  seguro y fuera de este repositorio** (no lo pongas en `dga-worker/` ni
+  en `centro-mando-app/`, para que nunca quede en un `git add .` por
+  accidente).
+
+**3. Crear la Sheet y compartirla**
+- Creá una hoja de cálculo nueva en Google Sheets.
+- Renombrá la pestaña de abajo a **`DATOS`** (el Worker escribe ahí
+  específicamente — ver `sheets.js`, constante `range`).
+- **Compartila** con el `client_email` que aparece en el JSON descargado
+  (algo como `dgaapi@tu-proyecto.iam.gserviceaccount.com`), con permiso de
+  **Editor**.
+- Copiá el ID de la Sheet de la URL: en
+  `https://docs.google.com/spreadsheets/d/ESTE_ES_EL_ID/edit`, es la parte
+  entre `/d/` y `/edit`.
+
+**4. Configurar los Secrets en Cloudflare**
+
+Dentro de la carpeta `dga-worker`:
+```powershell
+wrangler secret put GOOGLE_CLIENT_EMAIL
+```
+Te va a pedir pegar un valor — pegá el `client_email` del JSON descargado.
+
+```powershell
+wrangler secret put GOOGLE_PRIVATE_KEY
+```
+Pegá el valor completo de `private_key` del JSON (incluye los
+`-----BEGIN PRIVATE KEY-----` / `-----END PRIVATE KEY-----` y los saltos
+de línea `\n` tal cual vienen en el archivo).
+
+```powershell
+wrangler secret put GOOGLE_SHEET_ID
+```
+Pegá el ID de la Sheet que copiaste en el paso 3.
+
+**5. Desplegar**
+```powershell
+wrangler deploy
+```
+
+### Confirmar que el cron está corriendo
+En **https://dash.cloudflare.com** → tu Worker → pestaña **"Triggers"** o
+**"Cron Triggers"**, deberías ver el horario configurado
+(`*/30 * * * *` = cada 30 minutos). En **"Logs"** podés ver si cada
+corrida guardó filas correctamente o tiró algún error — el cron nunca
+rompe el resto del sistema si falla (queda solo en los logs, y reintenta
+en la corrida siguiente).
+
+### Si necesitás rotar la clave
+Si en algún momento la clave privada quedó expuesta (por ejemplo,
+compartida sin querer), rotarla no rompe nada del lado del dashboard:
+1. Google Cloud Console → la cuenta de servicio → pestaña **Claves** →
+   inhabilitá/eliminá la clave vieja → creá una nueva.
+2. `wrangler secret put GOOGLE_PRIVATE_KEY` de nuevo, con el valor nuevo.
+3. `wrangler deploy`.
+El `client_email` no cambia, así que no hace falta volver a compartir la
+Sheet.
+
 ## Límites del plan gratuito
 - 100.000 peticiones por día — más que suficiente para uso personal.
 - Duración máxima por petición: sobrada para este caso (~20-25s en el peor
@@ -71,6 +162,10 @@ La URL no cambia entre despliegues.
   momento, el Worker puede cortar la petición de detalle — en ese caso
   simplemente devuelve las alertas sin detalle en vez de fallar del todo.
 - No requiere tarjeta de crédito para este nivel de uso.
+- **Google Sheets API** (gratis): 60 escrituras/minuto y 60 lecturas/minuto
+  por usuario, muy por encima de lo que este Worker necesita (una
+  escritura cada 30 min, una lectura por cada vez que alguien abre una
+  categoría en el dashboard).
 
 ## Nota sobre el scraping
 Igual que el script Python, este Worker hace scraping de una página pública

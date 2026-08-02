@@ -749,6 +749,7 @@ function StationCard({ station, index, onOpen }) {
             </p>
             <p className="font-mono text-[12px] font-medium text-[#9BAEA8]">umbral {station.umbral}{station.unidad}</p>
           </div>
+          {station.tendencia && <TendenciaTag tendencia={station.tendencia} />}
         </div>
 
         {/* Caudal, si está disponible — bloque propio para que se note tanto como el nivel de agua */}
@@ -859,6 +860,7 @@ function StationDialog({ station, onClose }) {
                 </p>
               </div>
             </div>
+            {station.tendencia && <TendenciaTag tendencia={station.tendencia} />}
           </div>
 
           {/* Ubicación exacta de la estación */}
@@ -927,5 +929,45 @@ function Stat({ label, value, unit }) {
         {value}<span className="text-[11px] text-[#9BAEA8] font-normal ml-1">{unit}</span>
       </p>
     </div>
+  );
+}
+
+// Muestra "subió/bajó/estable X% desde hace N min", calculado por el
+// Worker comparando contra el histórico guardado en Sheets (ver
+// worker.js y sheets.js). El "ahora" siempre es un valor scrapeado en vivo
+// de la DGA (nunca sale de Sheets); el "hace N min" es la corrida más
+// reciente que el cron haya guardado — ese intervalo NO es un fijo de 30
+// minutos, varía según en qué momento entre dos corridas del cron el
+// usuario abrió el dashboard (puede ser 2 min, 18 min, 29 min...), por eso
+// se calcula en tiempo real acá en vez de mostrar un texto fijo.
+//
+// Si `tendencia` es null (no había snapshot anterior con qué comparar —
+// p.ej. el cron nunca corrió todavía para esta estación), no se renderiza
+// nada, así que los componentes que lo usan ya chequean
+// `station.tendencia &&` antes de pasarlo acá.
+function TendenciaTag({ tendencia }) {
+  const { direccion, porcentaje, diferenciaMetros, timestampAnterior } = tendencia;
+  const config = {
+    subiendo: { icon: "↑", color: "text-[#F5C876]", label: "Subiendo" },
+    bajando: { icon: "↓", color: "text-[#7ECBDE]", label: "Bajando" },
+    estable: { icon: "→", color: "text-[#9BAEA8]", label: "Estable" },
+  }[direccion] || { icon: "→", color: "text-[#9BAEA8]", label: "Estable" };
+
+  const minutosTranscurridos = timestampAnterior
+    ? Math.max(1, Math.round((Date.now() - new Date(timestampAnterior).getTime()) / 60000))
+    : null;
+
+  return (
+    <p className={`font-mono text-[11px] font-semibold mt-2 flex items-center gap-1 ${config.color}`}>
+      <span className="text-[13px]">{config.icon}</span>
+      {config.label}
+      {porcentaje != null && ` ${Math.abs(porcentaje)}%`}
+      {diferenciaMetros != null && direccion !== "estable" && (
+        <span className="text-[#7C8F88] font-normal"> ({diferenciaMetros > 0 ? "+" : ""}{diferenciaMetros}m)</span>
+      )}
+      {minutosTranscurridos != null && (
+        <span className="text-[#5C726A] font-normal">· hace {minutosTranscurridos} min</span>
+      )}
+    </p>
   );
 }

@@ -1,3 +1,11 @@
 name = "alertas-rios-dga"
 main = "worker.js"
 compatibility_date = "2024-11-01"
+
+# Cron Trigger: corre automáticamente cada 30 minutos, en la nube de
+# Cloudflare, SIN que ningún usuario tenga que visitar la web. Dispara la
+# función `scheduled()` del worker, que guarda un snapshot de Nivel de Agua
+# de todas las estaciones en alerta en Google Sheets — es lo que permite
+# calcular "subió/bajó desde hace 30 min" cuando alguien abre el dashboard.
+[triggers]
+crons = ["*/30 * * * *"]

@@ -1,0 +1,7 @@
+# Cualquier archivo de credenciales de Google (Service Account) que se
+# descargue en esta carpeta por accidente NUNCA debe subirse a git — las
+# credenciales reales van como Cloudflare Secrets (wrangler secret put),
+# nunca como archivo. Ver README.md, sección "Histórico y tendencia".
+*.json
+credentials/
+.dev.vars
