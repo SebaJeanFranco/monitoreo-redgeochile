@@ -27,6 +27,7 @@ const ALERT_STYLES = {
     border: "border-[#E8492E]",
     borderSoft: "border-[#E8492E]/40",
     bg: "bg-[#E8492E]/[0.07]",
+    hoverBg: "hover:bg-[#E8492E]/[0.07]",
     bar: "bg-[#E8492E]",
     text: "text-[#FF8B6B]",
     chip: "bg-[#E8492E]/20 text-[#FF8B6B] border-[#E8492E]/50",
@@ -38,6 +39,7 @@ const ALERT_STYLES = {
     border: "border-[#E8A33D]",
     borderSoft: "border-[#E8A33D]/40",
     bg: "bg-[#E8A33D]/[0.05]",
+    hoverBg: "hover:bg-[#E8A33D]/[0.05]",
     bar: "bg-[#E8A33D]",
     text: "text-[#F5C876]",
     chip: "bg-[#E8A33D]/15 text-[#F5C876] border-[#E8A33D]/40",
@@ -49,6 +51,7 @@ const ALERT_STYLES = {
     border: "border-[#3B8FA3]",
     borderSoft: "border-[#3B8FA3]/35",
     bg: "bg-[#3B8FA3]/[0.06]",
+    hoverBg: "hover:bg-[#3B8FA3]/[0.06]",
     bar: "bg-[#3B8FA3]",
     text: "text-[#7ECBDE]",
     chip: "bg-[#3B8FA3]/15 text-[#7ECBDE] border-[#3B8FA3]/40",
@@ -97,36 +100,45 @@ function groupByRegion(stations) {
 // local (VITE_DGA_WORKER_URL=https://tu-worker.workers.dev) para no dejar
 // la URL hardcodeada en el código fuente.
 const WORKER_URL = import.meta.env.VITE_DGA_WORKER_URL || null;
-const INCLUDE_DETALLE = true; // pide Caudal/Precipitación (más lento, ~15-25s)
 
-// Estimado de cuánto tarda una carga típica con --detalle (basado en las
-// pruebas reales: ~11-15 estaciones en alerta, ~0.9s de pausa entre cada
-// una más el tiempo de red = 15-25s). No es exacto — el número real de
-// estaciones en alerta varía día a día — así que esto es una ESTIMACIÓN
-// para darle al usuario una referencia, no una cuenta regresiva precisa.
-const ESTIMATED_LOAD_MS = 20000;
+// Estimado para la carga INICIAL (sin detalle, todas las categorías) — esto
+// es rápido (~2-3s reales medidos contra el Worker), muy distinto al
+// estimado de ~20s que existía cuando la carga inicial pedía Caudal de
+// Roja+Amarilla de una sola vez.
+const ESTIMATED_LOAD_MS = 3500;
+
+// Estimado para la carga de UNA categoría con detalle (al pinchar un botón
+// grande). Basado en pruebas reales: peticiones en serie a ~0.7-1s cada
+// una, con hasta MAX_DETALLE_STATIONS (30) estaciones en el peor caso.
+const ESTIMATED_CATEGORIA_LOAD_MS = 18000;
 
 // Convierte tiempo transcurrido en progreso de barra (0-100) usando una
 // curva de desaceleración: avanza rápido al principio y se frena cerca del
 // tope en vez de llegar a 100% y quedarse "pegada" si la carga real tarda
 // más que el estimado (lo cual puede pasar: no controlamos cuántas
 // estaciones habrá en alerta ni la velocidad de respuesta de la DGA).
-function estimateProgress(elapsedMs) {
-  const ratio = elapsedMs / ESTIMATED_LOAD_MS;
+// `totalMs` es configurable porque hay dos escenarios con duraciones muy
+// distintas: la carga inicial (~3.5s) y la carga de una categoría con
+// detalle (~18s).
+function estimateProgress(elapsedMs, totalMs) {
+  const ratio = elapsedMs / totalMs;
   // Ease-out: se acerca a 92% asintóticamente, nunca llega a "trabado en 100%"
   const progress = 92 * (1 - Math.exp(-2.2 * ratio));
   return Math.min(progress, 97);
 }
 
-function estimateSecondsLeft(elapsedMs) {
-  const remainingMs = ESTIMATED_LOAD_MS - elapsedMs;
+function estimateSecondsLeft(elapsedMs, totalMs) {
+  const remainingMs = totalMs - elapsedMs;
   if (remainingMs <= 0) return 0;
   return Math.ceil(remainingMs / 1000);
 }
 
-async function loadAlerts() {
+// Carga rápida inicial: SIN Caudal, todas las categorías. Es lo primero
+// que se pide al abrir la página — solo conteos, ubicaciones y nivel de
+// agua, ~2-3s en vez de ~15-20s.
+async function loadAlertasBasicas() {
   if (WORKER_URL) {
-    const endpoint = `${WORKER_URL.replace(/\/$/, "")}/alertas${INCLUDE_DETALLE ? "?detalle=1" : ""}`;
+    const endpoint = `${WORKER_URL.replace(/\/$/, "")}/alertas`;
     const res = await fetch(endpoint, { cache: "no-store" });
     if (!res.ok) throw new Error(`El Worker respondió con error (HTTP ${res.status}).`);
     return res.json();
@@ -139,19 +151,55 @@ async function loadAlerts() {
   return res.json();
 }
 
+// Carga de detalle (con Caudal) para UNA categoría específica — se llama
+// recién cuando el usuario pincha uno de los 3 botones grandes ("Ver
+// alertas Rojas", etc.), no en la carga inicial.
+async function loadAlertasCategoria(color) {
+  if (WORKER_URL) {
+    const endpoint = `${WORKER_URL.replace(/\/$/, "")}/alertas?detalle=1&color=${encodeURIComponent(color)}`;
+    const res = await fetch(endpoint, { cache: "no-store" });
+    if (!res.ok) throw new Error(`El Worker respondió con error (HTTP ${res.status}).`);
+    return res.json();
+  }
+  // Sin Worker, el archivo estático ya trae (o no) el detalle que tenga
+  // guardado — se filtra localmente por color en vez de volver a pedir nada.
+  const res = await fetch(`${import.meta.env.BASE_URL}alertas-rios.json`, { cache: "no-store" });
+  if (!res.ok) throw new Error("No se pudo cargar alertas-rios.json");
+  const json = await res.json();
+  return { ...json, estaciones: (json.estaciones || []).filter(s => s.tipoAlerta === color) };
+}
+
 export default function CentroMando() {
+  // `data`: resultado de la carga básica inicial (todas las categorías,
+  // SIN Caudal) — es lo que alimenta los conteos, el desglose regional y
+  // el mapa general. Se pide una sola vez al abrir la página (o al
+  // apretar "Actualizar").
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState(null);
   const [elapsedMs, setElapsedMs] = useState(0);
 
+  // `categoriaAbierta`: null | "Roja" | "Amarilla" | "Azul" — cuál de los 3
+  // botones grandes está expandido ahora mismo mostrando su grilla de
+  // tarjetas. `detalleCategoria` es la respuesta CON Caudal de esa
+  // categoría, pedida recién al pinchar el botón — no antes.
+  const [categoriaAbierta, setCategoriaAbierta] = useState(null);
+  const [detalleCategoria, setDetalleCategoria] = useState(null);
+  const [loadingCategoria, setLoadingCategoria] = useState(false);
+  const [errorCategoria, setErrorCategoria] = useState(null);
+  const [elapsedCategoriaMs, setElapsedCategoriaMs] = useState(0);
+
   async function refresh() {
     setLoading(true);
     setError(null);
     setElapsedMs(0);
+    // Un refresh general también cierra cualquier categoría abierta — sus
+    // datos de detalle quedarían basados en la carga anterior.
+    setCategoriaAbierta(null);
+    setDetalleCategoria(null);
     try {
-      const json = await loadAlerts();
+      const json = await loadAlertasBasicas();
       setData(json);
     } catch (e) {
       setError(
@@ -162,6 +210,28 @@ export default function CentroMando() {
     } finally {
       setLoading(false);
     }
+  }
+
+  async function abrirCategoria(color) {
+    setCategoriaAbierta(color);
+    setDetalleCategoria(null);
+    setErrorCategoria(null);
+    setLoadingCategoria(true);
+    setElapsedCategoriaMs(0);
+    try {
+      const json = await loadAlertasCategoria(color);
+      setDetalleCategoria(json);
+    } catch (e) {
+      setErrorCategoria(`No se pudo cargar el detalle de ${color} (${e.message}).`);
+    } finally {
+      setLoadingCategoria(false);
+    }
+  }
+
+  function cerrarCategoria() {
+    setCategoriaAbierta(null);
+    setDetalleCategoria(null);
+    setErrorCategoria(null);
   }
 
   useEffect(() => {
@@ -178,6 +248,17 @@ export default function CentroMando() {
     return () => clearInterval(id);
   }, [loading, data]);
 
+  // Mismo cronómetro, pero para la carga de una categoría específica al
+  // pinchar un botón grande.
+  useEffect(() => {
+    if (!loadingCategoria) return;
+    const start = Date.now();
+    const id = setInterval(() => setElapsedCategoriaMs(Date.now() - start), 200);
+    return () => clearInterval(id);
+  }, [loadingCategoria]);
+
+  // Estaciones básicas (sin Caudal) de la carga inicial, ordenadas por
+  // urgencia — alimentan el mapa general y los conteos.
   const sorted = useMemo(() => {
     if (!data?.estaciones) return [];
     return sortByUrgency(data.estaciones);
@@ -188,6 +269,12 @@ export default function CentroMando() {
     sorted.forEach(s => { if (c[s.tipoAlerta] != null) c[s.tipoAlerta]++; });
     return c;
   }, [sorted]);
+
+  // Estaciones CON Caudal de la categoría actualmente abierta (si hay una).
+  const sortedCategoria = useMemo(() => {
+    if (!detalleCategoria?.estaciones) return [];
+    return sortByUrgency(detalleCategoria.estaciones);
+  }, [detalleCategoria]);
 
   const byRegion = useMemo(() => groupByRegion(sorted), [sorted]);
 
@@ -242,7 +329,7 @@ export default function CentroMando() {
             <p className="font-display font-semibold text-xl text-[#EDF2F0]">Actualizando datos... un momento por favor</p>
             <p className="font-mono text-[12px] text-[#9BAEA8] mt-2 max-w-sm">
               {WORKER_URL
-                ? "Consultando estaciones de la DGA en vivo, incluyendo Caudal y Precipitación."
+                ? "Consultando estaciones de la DGA en vivo."
                 : "Cargando el último registro disponible."}
             </p>
           </div>
@@ -252,13 +339,13 @@ export default function CentroMando() {
               <div className="h-1.5 rounded-full bg-[#1E332C] overflow-hidden">
                 <div
                   className="h-full rounded-full bg-[#3B8FA3] transition-[width] duration-200 ease-linear"
-                  style={{ width: `${estimateProgress(elapsedMs)}%` }}
+                  style={{ width: `${estimateProgress(elapsedMs, ESTIMATED_LOAD_MS)}%` }}
                 />
               </div>
               <p className="font-mono text-[11px] text-[#7C8F88] mt-2">
-                {estimateSecondsLeft(elapsedMs) > 0
-                  ? `Tiempo estimado restante: ~${estimateSecondsLeft(elapsedMs)}s`
-                  : "Ya casi — algunas estaciones están tardando un poco más de lo habitual."}
+                {estimateSecondsLeft(elapsedMs, ESTIMATED_LOAD_MS) > 0
+                  ? `Tiempo estimado restante: ~${estimateSecondsLeft(elapsedMs, ESTIMATED_LOAD_MS)}s`
+                  : "Ya casi — la DGA está tardando un poco más de lo habitual."}
               </p>
             </div>
           )}
@@ -373,25 +460,65 @@ export default function CentroMando() {
           </div>
         )}
 
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-          {sorted.map((station, i) => (
-            <StationCard
-              key={station.codigo}
-              station={station}
-              index={i}
-              onOpen={() => setSelected(station)}
-            />
-          ))}
-        </div>
-
+        {/* 3 botones grandes por categoría — el detalle (con Caudal) de
+            cada una se pide recién al pincharlo, no de entrada. */}
         {sorted.length > 0 && (
-          <section className="mt-8">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-8">
+            <CategoryButton
+              styleKey="Roja"
+              label="Revisar alertas Rojas"
+              count={counts.Roja}
+              active={categoriaAbierta === "Roja"}
+              onClick={() => (categoriaAbierta === "Roja" ? cerrarCategoria() : abrirCategoria("Roja"))}
+            />
+            <CategoryButton
+              styleKey="Amarilla"
+              label="Revisar alertas Amarillas"
+              count={counts.Amarilla}
+              active={categoriaAbierta === "Amarilla"}
+              onClick={() => (categoriaAbierta === "Amarilla" ? cerrarCategoria() : abrirCategoria("Amarilla"))}
+            />
+            <CategoryButton
+              styleKey="Azul"
+              label="Revisar alertas Azules"
+              count={counts.Azul}
+              active={categoriaAbierta === "Azul"}
+              onClick={() => (categoriaAbierta === "Azul" ? cerrarCategoria() : abrirCategoria("Azul"))}
+            />
+          </div>
+        )}
+
+        {/* Mapa general — siempre visible con los datos básicos (todas las
+            categorías juntas), para que la pantalla inicial no se sienta
+            vacía con solo 3 botones. No tiene Caudal, es puramente
+            referencial (igual que antes). */}
+        {sorted.length > 0 && (
+          <section className="mb-8">
             <div className="flex items-center gap-2 mb-3">
               <MapIcon className="w-4 h-4 text-[#9BAEA8]" />
               <h2 className="font-display font-semibold text-base text-[#C7D3CE]">Mapa de estaciones en alerta</h2>
               <span className="font-mono text-[11px] text-[#7C8F88] ml-auto">Vista general — abrí una ficha para ver su ubicación exacta</span>
             </div>
             <StationsMap stations={sorted} />
+          </section>
+        )}
+
+        {/* Sección expandible: se muestra solo cuando el usuario pinchó
+            uno de los 3 botones. Acá sí vive la grilla de tarjetas con
+            Caudal, igual que el diseño anterior — solo que ahora es
+            "bajo demanda" en vez de cargarse siempre de entrada. */}
+        {categoriaAbierta && (
+          <section className="mb-8">
+            <CategoriaExpandida
+              color={categoriaAbierta}
+              loading={loadingCategoria}
+              error={errorCategoria}
+              elapsedMs={elapsedCategoriaMs}
+              estaciones={sortedCategoria}
+              onRetry={() => abrirCategoria(categoriaAbierta)}
+              onClose={cerrarCategoria}
+              onOpenStation={setSelected}
+            />
           </section>
         )}
 
@@ -441,6 +568,116 @@ function RegionFigure({ count, styleKey }) {
     <div className="flex flex-col items-center min-w-[38px]">
       <p className={`font-display font-bold text-[22px] leading-none ${active ? s.text : "text-[#2A4038]"}`}>{count}</p>
       <p className={`font-mono text-[9px] uppercase tracking-wider font-bold mt-1 ${active ? s.text : "text-[#3C5850]"}`}>{styleKey}</p>
+    </div>
+  );
+}
+
+// ---------- Botón grande de categoría ----------
+// Uno de los 3 botones principales de la pantalla ("Revisar alertas
+// Rojas/Amarillas/Azules"). Al pincharlo se pide recién ahí el detalle
+// (con Caudal) de esa categoría — antes de eso solo se sabe el conteo,
+// que viene de la carga básica inicial.
+function CategoryButton({ styleKey, label, count, active, onClick }) {
+  const s = ALERT_STYLES[styleKey];
+  const disabled = count === 0;
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`rounded-xl border-2 px-5 py-6 text-left transition-all ${
+        disabled
+          ? "border-[#1E332C] bg-[#0F1B18] opacity-50 cursor-not-allowed"
+          : active
+            ? `${s.border} ${s.bg} -translate-y-0.5`
+            : `${s.borderSoft} bg-[#0F1B18] hover:-translate-y-0.5 ${s.hoverBg}`
+      }`}
+    >
+      <div className="flex items-center justify-between mb-2">
+        <span className={`font-mono text-[11px] font-bold uppercase tracking-widest ${disabled ? "text-[#5C726A]" : s.text}`}>
+          {styleKey}
+        </span>
+        {styleKey === "Roja" && count > 0 && <span className="w-2 h-2 rounded-full bg-[#FF8B6B] dot-pulse" />}
+      </div>
+      <p className="font-display font-bold text-[20px] text-white leading-tight mb-1">{label}</p>
+      <p className={`font-display font-bold text-[36px] leading-none ${disabled ? "text-[#3C5850]" : s.text}`}>
+        {count}
+        <span className="font-mono text-[13px] font-normal text-[#7C8F88] ml-2">
+          {count === 1 ? "estación" : "estaciones"}
+        </span>
+      </p>
+      {!disabled && (
+        <p className="font-mono text-[11px] text-[#7C8F88] mt-3">
+          {active ? "Tocá para cerrar ↑" : "Tocá para ver detalle y Caudal →"}
+        </p>
+      )}
+    </button>
+  );
+}
+
+// ---------- Sección expandida de una categoría ----------
+// Vive debajo de los 3 botones + el mapa. Maneja sus propios estados de
+// carga/error porque el detalle de esta categoría se pide de forma
+// independiente a la carga básica inicial.
+function CategoriaExpandida({ color, loading, error, elapsedMs, estaciones, onRetry, onClose, onOpenStation }) {
+  const s = ALERT_STYLES[color];
+  return (
+    <div className={`rounded-xl border ${s.borderSoft} ${s.bg} p-5`}>
+      <div className="flex items-center justify-between mb-4">
+        <h2 className={`font-display font-bold text-lg ${s.text}`}>Alertas {color} — detalle con Caudal</h2>
+        <button
+          onClick={onClose}
+          className="p-1.5 rounded-md text-[#9BAEA8] hover:text-white hover:bg-black/20 transition-colors"
+          aria-label="Cerrar"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+
+      {loading && (
+        <div className="flex flex-col items-center justify-center gap-3 py-12 text-center">
+          <RefreshCw className="w-5 h-5 text-[#7ECBDE] animate-spin" />
+          <p className="font-mono text-[12px] text-[#9BAEA8]">Consultando Caudal en la DGA, estación por estación...</p>
+          <div className="w-full max-w-xs">
+            <div className="h-1.5 rounded-full bg-[#1E332C] overflow-hidden">
+              <div
+                className="h-full rounded-full bg-[#3B8FA3] transition-[width] duration-200 ease-linear"
+                style={{ width: `${estimateProgress(elapsedMs, ESTIMATED_CATEGORIA_LOAD_MS)}%` }}
+              />
+            </div>
+            <p className="font-mono text-[11px] text-[#7C8F88] mt-2">
+              {estimateSecondsLeft(elapsedMs, ESTIMATED_CATEGORIA_LOAD_MS) > 0
+                ? `Tiempo estimado restante: ~${estimateSecondsLeft(elapsedMs, ESTIMATED_CATEGORIA_LOAD_MS)}s`
+                : "Ya casi — la DGA está tardando un poco más de lo habitual."}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {!loading && error && (
+        <div className="text-center py-8">
+          <AlertTriangle className="w-5 h-5 text-[#9BAEA8] mx-auto mb-2" />
+          <p className="text-[13px] text-[#C7D3CE] mb-3">{error}</p>
+          <button
+            onClick={onRetry}
+            className="text-[12px] font-mono text-[#9BAEA8] hover:text-[#7ECBDE] underline"
+          >
+            Reintentar
+          </button>
+        </div>
+      )}
+
+      {!loading && !error && (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+          {estaciones.map((station, i) => (
+            <StationCard
+              key={station.codigo}
+              station={station}
+              index={i}
+              onOpen={() => onOpenStation(station)}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
