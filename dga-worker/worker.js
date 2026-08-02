@@ -617,7 +617,13 @@ async function handleHistoricoEstacion(url, env) {
 // no solo la corrida más reciente de una estación puntual.
 // -----------------------------------------------------------------------
 async function handleResumenNacional(env) {
-  const allRows = await readAllSnapshotRows(env, 1500);
+  // 3000 filas cubren ~23 horas de histórico incluso en días con ~65
+  // estaciones en alerta por corrida (cada 30 min) — con margen para
+  // mostrar hasta 24h en la vista ampliada del gráfico (ver
+  // TendenciaNacionalDialog en el frontend). La vista chica del panorama
+  // general solo usa las últimas 6h de este mismo array, filtradas del
+  // lado del cliente.
+  const allRows = await readAllSnapshotRows(env, 3000);
   const corridas = resumenPorCorrida(allRows);
   return { corridas };
 }

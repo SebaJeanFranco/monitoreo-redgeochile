@@ -296,6 +296,12 @@ export default function CentroMando() {
   const [resumenNacional, setResumenNacional] = useState(null);
   const [resumenNacionalError, setResumenNacionalError] = useState(null);
 
+  // Diálogo grande de tendencia nacional — se abre al pinchar el gráfico
+  // chico del panorama general. Solo necesita saber si está abierto: los
+  // datos (`corridas`) son los mismos que ya tiene resumenNacional, no se
+  // vuelven a pedir.
+  const [tendenciaExpandida, setTendenciaExpandida] = useState(false);
+
   async function refresh() {
     setLoading(true);
     setError(null);
@@ -585,7 +591,11 @@ export default function CentroMando() {
           {(resumenNacional?.corridas?.length > 1 || resumenNacionalError) && (
             <div className="mt-5">
               <p className="text-[11px] uppercase tracking-widest text-[#9BAEA8] font-bold mb-3">Tendencia nacional — últimas 6 horas</p>
-              <TendenciaNacionalChart corridas={resumenNacional?.corridas} error={resumenNacionalError} />
+              <TendenciaNacionalChart
+                corridas={resumenNacional?.corridas}
+                error={resumenNacionalError}
+                onExpand={() => setTendenciaExpandida(true)}
+              />
             </div>
           )}
 
@@ -715,6 +725,13 @@ export default function CentroMando() {
           onClose={() => setSelected(null)}
           onOpenStation={setSelected}
           onObtenerCaudal={obtenerCaudal}
+        />
+      )}
+
+      {tendenciaExpandida && (
+        <TendenciaNacionalDialog
+          corridas={resumenNacional?.corridas}
+          onClose={() => setTendenciaExpandida(false)}
         />
       )}
       </>
@@ -1412,32 +1429,149 @@ function Stat({ label, value, unit }) {
 }
 
 // ---------- Tendencia nacional (panorama general) ----------
-// Total de alertas + desglose por color, en las últimas 6 horas, a partir
-// de las corridas del cron guardadas en Sheets (ver /resumen en
-// worker.js). El total va arriba como número grande con variación desde
-// el inicio de la ventana; el desglose por color va abajo como mini
-// gráfico de 3 líneas — mismo criterio SVG a mano que HistoricoChart, sin
-// agregar una librería de gráficos para esto.
-const HORAS_VENTANA_TENDENCIA = 6;
+// Total de alertas + desglose por color, a partir de las corridas del
+// cron guardadas en Sheets (ver /resumen en worker.js). Dos vistas
+// comparten la misma lógica de dibujo (TendenciaSVG): una chica en el
+// panorama general (6h, clickeable) y un diálogo grande con más espacio
+// y más historial (24h) al pinchar la chica.
+const HORAS_VENTANA_TENDENCIA_CHICA = 6;
+const HORAS_VENTANA_TENDENCIA_GRANDE = 24;
 
-function TendenciaNacionalChart({ corridas, error }) {
-  // Qué series están visibles ahora mismo — por defecto las 4 (Total +
-  // los 3 colores). Clickeando un chip de la leyenda se prende/apaga esa
-  // serie puntual, así el usuario puede aislar, por ejemplo, solo Roja
-  // para ver su evolución sin que Azul (normalmente el número más alto)
-  // aplaste la escala del gráfico.
+const SERIES_TENDENCIA = [
+  { key: "Total", color: "#EDF2F0", get: c => c.total },
+  { key: "Roja", color: "#FF8B6B", get: c => c.Roja || 0 },
+  { key: "Amarilla", color: "#F5C876", get: c => c.Amarilla || 0 },
+  { key: "Azul", color: "#7ECBDE", get: c => c.Azul || 0 },
+];
+
+// Hook compartido: filtra `corridas` a la ventana de horas pedida y
+// maneja qué series están visibles — usado tanto por la vista chica como
+// por el diálogo grande, cada una con su propia ventana y su propio
+// estado de filtro (aislar una serie en el diálogo no debe afectar la
+// vista chica de atrás, y viceversa).
+function useTendenciaData(corridas, horasVentana) {
   const [seriesActivas, setSeriesActivas] = useState({ Total: true, Roja: true, Amarilla: true, Azul: true });
 
   function toggleSerie(key) {
     setSeriesActivas(prev => {
       const next = { ...prev, [key]: !prev[key] };
-      // No permitir apagar todas — si el usuario intenta apagar la última
-      // serie visible, el click no tiene efecto (evita un gráfico vacío
-      // sin ninguna pista de qué pasó).
+      // No permitir apagar todas — evita un gráfico vacío sin pista de qué pasó.
       const quedanActivas = Object.values(next).some(Boolean);
       return quedanActivas ? next : prev;
     });
   }
+
+  const ahora = Date.now();
+  const ventanaMs = horasVentana * 60 * 60 * 1000;
+  const enVentana = (corridas || []).filter(c => ahora - new Date(c.timestamp).getTime() <= ventanaMs);
+  const seriesVisibles = SERIES_TENDENCIA.filter(s => seriesActivas[s.key]);
+
+  return { enVentana, seriesActivas, seriesVisibles, toggleSerie };
+}
+
+// Dibuja el SVG en sí — recibe ya calculado `enVentana`/`seriesVisibles` y
+// las dimensiones deseadas, para que la vista chica y el diálogo grande
+// puedan pedir distinto tamaño y distinta cantidad de etiquetas de hora
+// sin duplicar la lógica de escalas/paths.
+function TendenciaSVG({ enVentana, seriesVisibles, width = 600, height = 140, maxEtiquetas = 5, puntoRadio = 2.5 }) {
+  const W = width, H = height, padL = 32, padR = 12, padT = 10, padB = 26;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+
+  const times = enVentana.map(c => new Date(c.timestamp).getTime());
+  const tMin = Math.min(...times);
+  const tMax = Math.max(...times);
+  const tRango = Math.max(tMax - tMin, 1);
+
+  const maxY = Math.max(1, ...enVentana.flatMap(c => seriesVisibles.map(s => s.get(c))));
+
+  function x(i) { return padL + (plotW * (times[i] - tMin)) / tRango; }
+  function y(v) { return padT + plotH - (plotH * v) / maxY; }
+
+  const paso = Math.max(1, Math.ceil((enVentana.length - 1) / (maxEtiquetas - 1)));
+  const indicesEtiquetas = [];
+  for (let i = 0; i < enVentana.length; i += paso) indicesEtiquetas.push(i);
+  if (indicesEtiquetas[indicesEtiquetas.length - 1] !== enVentana.length - 1) indicesEtiquetas.push(enVentana.length - 1);
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" preserveAspectRatio="none" style={{ height: H }}>
+      {[0, maxY / 2, maxY].map((v, i) => (
+        <g key={i}>
+          <line x1={padL} x2={W - padR} y1={y(v)} y2={y(v)} stroke="#1E332C" strokeWidth="1" />
+          <text x={padL - 6} y={y(v) + 3} textAnchor="end" fontSize="9" fill="#7C8F88" fontFamily="IBM Plex Mono, monospace">
+            {Math.round(v)}
+          </text>
+        </g>
+      ))}
+      {seriesVisibles.map(s => (
+        <g key={s.key}>
+          <path
+            d={enVentana.map((c, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(s.get(c)).toFixed(1)}`).join(" ")}
+            fill="none"
+            stroke={s.color}
+            strokeWidth="2"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+          />
+          {/* Un punto por corrida — así se ve exactamente cuántas
+              lecturas hay y dónde cae cada una en el tiempo. */}
+          {enVentana.map((c, i) => (
+            <circle key={i} cx={x(i)} cy={y(s.get(c))} r={puntoRadio} fill={s.color} />
+          ))}
+        </g>
+      ))}
+      {/* Etiquetas de hora en el eje X, espaciadas parejo. */}
+      {indicesEtiquetas.map(i => (
+        <text
+          key={i}
+          x={x(i)}
+          y={H - 4}
+          textAnchor={i === 0 ? "start" : i === enVentana.length - 1 ? "end" : "middle"}
+          fontSize="9"
+          fill="#7C8F88"
+          fontFamily="IBM Plex Mono, monospace"
+        >
+          {new Date(enVentana[i].timestamp).toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })}
+        </text>
+      ))}
+    </svg>
+  );
+}
+
+// Chips de filtro por serie — clickeables, prenden/apagan cada línea.
+// Compartidos entre la vista chica y el diálogo grande.
+function TendenciaChips({ seriesActivas, toggleSerie, ultimo, tamanoGrande }) {
+  return (
+    <div className={`flex items-center gap-2 flex-wrap ${tamanoGrande ? "mb-4" : "mb-3"}`}>
+      {SERIES_TENDENCIA.map(s => {
+        const activa = seriesActivas[s.key];
+        return (
+          <button
+            key={s.key}
+            onClick={() => toggleSerie(s.key)}
+            className={`flex items-center gap-1.5 font-mono font-semibold rounded-md border transition-colors ${
+              tamanoGrande ? "text-[12px] px-3 py-1.5" : "text-[10px] px-2 py-1"
+            }`}
+            style={{
+              color: activa ? s.color : "#5C726A",
+              borderColor: activa ? `${s.color}66` : "#1E332C",
+              backgroundColor: activa ? `${s.color}14` : "transparent",
+            }}
+            aria-pressed={activa}
+          >
+            <span className={tamanoGrande ? "w-2.5 h-2.5 rounded-full" : "w-2 h-2 rounded-full"} style={{ backgroundColor: activa ? s.color : "#3C5850" }} />
+            {s.key} {s.get(ultimo)}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// Vista chica del panorama general — clickeable, abre el diálogo grande
+// con más historial. `corridas` viene tal cual de /resumen.
+function TendenciaNacionalChart({ corridas, error, onExpand }) {
+  const { enVentana, seriesActivas, seriesVisibles, toggleSerie } = useTendenciaData(corridas, HORAS_VENTANA_TENDENCIA_CHICA);
 
   if (error) {
     return (
@@ -1446,10 +1580,6 @@ function TendenciaNacionalChart({ corridas, error }) {
       </div>
     );
   }
-
-  const ahora = Date.now();
-  const ventanaMs = HORAS_VENTANA_TENDENCIA * 60 * 60 * 1000;
-  const enVentana = (corridas || []).filter(c => ahora - new Date(c.timestamp).getTime() <= ventanaMs);
 
   if (enVentana.length < 2) {
     return (
@@ -1464,33 +1594,6 @@ function TendenciaNacionalChart({ corridas, error }) {
   const primero = enVentana[0];
   const ultimo = enVentana[enVentana.length - 1];
   const variacionTotal = ultimo.total - primero.total;
-
-  // Layout del SVG — igual criterio que HistoricoChart.
-  const W = 600, H = 140, padL = 28, padR = 12, padT = 10, padB = 26;
-  const plotW = W - padL - padR;
-  const plotH = H - padT - padB;
-
-  const times = enVentana.map(c => new Date(c.timestamp).getTime());
-  const tMin = Math.min(...times);
-  const tMax = Math.max(...times);
-  const tRango = Math.max(tMax - tMin, 1);
-
-  const TODAS_LAS_SERIES = [
-    { key: "Total", color: "#EDF2F0", get: c => c.total },
-    { key: "Roja", color: "#FF8B6B", get: c => c.Roja || 0 },
-    { key: "Amarilla", color: "#F5C876", get: c => c.Amarilla || 0 },
-    { key: "Azul", color: "#7ECBDE", get: c => c.Azul || 0 },
-  ];
-  const seriesVisibles = TODAS_LAS_SERIES.filter(s => seriesActivas[s.key]);
-
-  // El eje Y se reescala según lo que esté visible — así aislar una sola
-  // serie (ej. solo Roja) la muestra usando todo el alto disponible, en
-  // vez de quedar aplastada contra el piso por la escala de Total/Azul.
-  const maxY = Math.max(1, ...enVentana.flatMap(c => seriesVisibles.map(s => s.get(c))));
-
-  function x(i) { return padL + (plotW * (times[i] - tMin)) / tRango; }
-  function y(v) { return padT + plotH - (plotH * v) / maxY; }
-
   const fmtHora = ts => new Date(ts).toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" });
 
   return (
@@ -1511,77 +1614,77 @@ function TendenciaNacionalChart({ corridas, error }) {
         )}
       </div>
 
-      {/* Chips de filtro — clickeables, prenden/apagan cada serie */}
-      <div className="flex items-center gap-2 mb-3 flex-wrap">
-        {TODAS_LAS_SERIES.map(s => {
-          const activa = seriesActivas[s.key];
-          return (
-            <button
-              key={s.key}
-              onClick={() => toggleSerie(s.key)}
-              className="flex items-center gap-1.5 font-mono text-[10px] font-semibold px-2 py-1 rounded-md border transition-colors"
-              style={{
-                color: activa ? s.color : "#5C726A",
-                borderColor: activa ? `${s.color}66` : "#1E332C",
-                backgroundColor: activa ? `${s.color}14` : "transparent",
-              }}
-              aria-pressed={activa}
-            >
-              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: activa ? s.color : "#3C5850" }} />
-              {s.key} {s.get(ultimo)}
-            </button>
-          );
-        })}
+      <TendenciaChips seriesActivas={seriesActivas} toggleSerie={toggleSerie} ultimo={ultimo} />
+
+      {/* El SVG es clickeable — abre el diálogo grande con 24h. Un
+          click en un chip de arriba no debe disparar esto (los chips
+          son botones propios con su propio onClick, que no burbujea
+          hasta acá porque no está dentro de este bloque clickeable). */}
+      <button
+        onClick={onExpand}
+        className="w-full text-left cursor-pointer group"
+        aria-label="Ver tendencia nacional en grande"
+      >
+        <TendenciaSVG enVentana={enVentana} seriesVisibles={seriesVisibles} height={140} />
+        <p className="text-[10px] font-mono text-[#5C726A] mt-1 text-right group-hover:text-[#7ECBDE] transition-colors">
+          Tocá el gráfico para ampliar →
+        </p>
+      </button>
+    </div>
+  );
+}
+
+// Diálogo grande — mismo gráfico, más espacio y más historial (24h en vez
+// de 6h). Vive como overlay independiente, igual patrón que StationDialog.
+function TendenciaNacionalDialog({ corridas, onClose }) {
+  const { enVentana, seriesActivas, seriesVisibles, toggleSerie } = useTendenciaData(corridas, HORAS_VENTANA_TENDENCIA_GRANDE);
+
+  useEffect(() => {
+    function onKey(e) { if (e.key === "Escape") onClose(); }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const suficientesDatos = enVentana.length >= 2;
+  const ultimo = suficientesDatos ? enVentana[enVentana.length - 1] : null;
+
+  return (
+    <div
+      className="fixed inset-0 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm"
+      style={{ zIndex: 10000 }}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Tendencia nacional ampliada"
+      onClick={onClose}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        className="w-full max-w-4xl max-h-[90vh] overflow-y-auto rounded-xl border border-[#1E332C] bg-[#0F1B18] shadow-2xl"
+      >
+        <div className="flex items-start justify-between gap-4 px-8 py-6 border-b border-[#1E332C]">
+          <div>
+            <h2 className="font-display font-bold text-2xl text-white leading-tight">Tendencia nacional</h2>
+            <p className="text-[13px] font-medium text-[#C7D3CE] mt-1">Últimas {HORAS_VENTANA_TENDENCIA_GRANDE} horas — una lectura cada 30 min</p>
+          </div>
+          <button onClick={onClose} className="p-2 rounded-md text-[#9BAEA8] hover:text-[#EDF2F0] hover:bg-[#1E332C] transition-colors flex-shrink-0">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="px-8 py-6">
+          {!suficientesDatos && (
+            <p className="text-[13px] text-[#9BAEA8] leading-relaxed">
+              Todavía no hay suficiente histórico guardado para esta ventana — el cron guarda una corrida cada 30 min, volvé a revisar más tarde.
+            </p>
+          )}
+          {suficientesDatos && (
+            <>
+              <TendenciaChips seriesActivas={seriesActivas} toggleSerie={toggleSerie} ultimo={ultimo} tamanoGrande />
+              <TendenciaSVG enVentana={enVentana} seriesVisibles={seriesVisibles} height={340} maxEtiquetas={8} puntoRadio={3} />
+            </>
+          )}
+        </div>
       </div>
-
-      {/* Mini gráfico — solo las series activas */}
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" preserveAspectRatio="none" style={{ height: 140 }}>
-        {[0, maxY / 2, maxY].map((v, i) => (
-          <line key={i} x1={padL} x2={W - padR} y1={y(v)} y2={y(v)} stroke="#1E332C" strokeWidth="1" />
-        ))}
-        {seriesVisibles.map(s => (
-          <g key={s.key}>
-            <path
-              d={enVentana.map((c, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(s.get(c)).toFixed(1)}`).join(" ")}
-              fill="none"
-              stroke={s.color}
-              strokeWidth="2"
-              strokeLinejoin="round"
-              strokeLinecap="round"
-            />
-            {/* Un punto por corrida — así se ve exactamente cuántas
-                lecturas hay y dónde cae cada una en el tiempo, no solo la
-                tendencia general de la línea. */}
-            {enVentana.map((c, i) => (
-              <circle key={i} cx={x(i)} cy={y(s.get(c))} r="2.5" fill={s.color} />
-            ))}
-          </g>
-        ))}
-
-        {/* Etiquetas de hora en el eje X — hasta 5, espaciadas parejo
-            entre la primera y la última corrida, para saber a qué hora
-            fue cada tramo sin tener que pasar el mouse por cada punto. */}
-        {(() => {
-          const maxEtiquetas = 5;
-          const paso = Math.max(1, Math.ceil((enVentana.length - 1) / (maxEtiquetas - 1)));
-          const indices = [];
-          for (let i = 0; i < enVentana.length; i += paso) indices.push(i);
-          if (indices[indices.length - 1] !== enVentana.length - 1) indices.push(enVentana.length - 1);
-          return indices.map(i => (
-            <text
-              key={i}
-              x={x(i)}
-              y={H - 4}
-              textAnchor={i === 0 ? "start" : i === enVentana.length - 1 ? "end" : "middle"}
-              fontSize="9"
-              fill="#7C8F88"
-              fontFamily="IBM Plex Mono, monospace"
-            >
-              {new Date(enVentana[i].timestamp).toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })}
-            </text>
-          ));
-        })()}
-      </svg>
     </div>
   );
 }
