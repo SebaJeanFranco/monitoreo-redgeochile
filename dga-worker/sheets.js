@@ -293,17 +293,49 @@ export async function appendLogRows(env, entries) {
 }
 
 // ---------------------------------------------------------------------------
-// Lectura: trae TODAS las filas de la hoja (simple pero funcional para el
-// volumen esperado — ver nota de límites en worker.js). Se usa para
-// encontrar, por cada estación, su snapshot más reciente ANTERIOR a la
-// corrida actual, y así calcular la diferencia.
-// ---------------------------------------------------------------------------
-export async function readAllSnapshotRows(env) {
+// Lectura: trae las ÚLTIMAS `maxRows` filas de la hoja (no la hoja entera).
+// Se usa para encontrar, por cada estación, su snapshot más reciente
+// ANTERIOR a la corrida actual, y así calcular la diferencia — para eso
+// alcanza con un tramo reciente del histórico, no hace falta traer todas
+// las filas acumuladas desde que el cron empezó a correr.
+//
+// Por qué esto importa: la hoja "DATOS" crece sin límite (el cron agrega
+// filas cada 30 min, para siempre). Traer TODA la hoja en cada apertura de
+// categoría (lo que hacía la versión anterior de esta función) empezó
+// rápido cuando la hoja tenía pocas filas, pero fue empeorando con el
+// tiempo a medida que se acumulaban corridas — al punto de volver lenta
+// la carga básica de una categoría (que debería ser rápida, ~3s, ya que
+// ya no pide Caudal) simplemente por el peso de leer y transferir miles de
+// filas de Sheets en cada clic. Limitar a un tramo reciente resuelve esto
+// sin perder precisión: `findLatestPreviousByCode` solo necesita la
+// corrida más reciente por código, que siempre está en las últimas filas.
+//
+// Se calcula el rango exacto a pedir (en vez de traer todo y cortar
+// después) consultando primero cuántas filas tiene la hoja — así el
+// ahorro es real en la petición a Sheets, no solo en el procesamiento
+// posterior del lado del Worker.
+export async function readAllSnapshotRows(env, maxRows = 500) {
   const sheetId = env.GOOGLE_SHEET_ID;
   if (!sheetId) throw new Error("Falta el secret GOOGLE_SHEET_ID.");
 
   const token = await getAccessToken(env);
-  const range = "DATOS!A:H";
+
+  // Paso 1: cuántas filas tiene la hoja ahora mismo. Se pide solo la
+  // columna A (la más liviana posible) para este cálculo.
+  const countUrl = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent("DATOS!A:A")}`;
+  const countResp = await fetch(countUrl, { headers: { Authorization: `Bearer ${token}` } });
+  if (!countResp.ok) {
+    const text = await countResp.text();
+    throw new Error(`Google Sheets read (conteo) falló (HTTP ${countResp.status}): ${text}`);
+  }
+  const countData = await countResp.json();
+  const totalRows = (countData.values || []).length;
+
+  // Paso 2: traer solo el tramo final — últimas `maxRows` filas, sin
+  // contar la fila 1 (cabecera, si existe). Si la hoja tiene menos filas
+  // que maxRows, se trae desde la fila 2 (después de la cabecera) directo.
+  const startRow = Math.max(2, totalRows - maxRows + 1);
+  const range = `DATOS!A${startRow}:H${totalRows}`;
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}`;
 
   const resp = await fetch(url, {
@@ -320,7 +352,9 @@ export async function readAllSnapshotRows(env) {
   // La fila 1 puede ser la cabecera (["timestamp","codigo",...], ver
   // ensureSheetHeader) — si está, se descarta acá para que no se procese
   // como si fuera una lectura real (rompería Number() en las columnas
-  // numéricas, ya que "valorMedicion" no es un número válido).
+  // numéricas, ya que "valorMedicion" no es un número válido). Con el
+  // rango acotado de arriba esto ya casi nunca debería pasar (startRow
+  // parte en 2 como mucho), pero se deja como red de seguridad.
   if (rows.length > 0 && rows[0][0] === HEADER_ROW[0] && rows[0][1] === HEADER_ROW[1]) {
     rows = rows.slice(1);
   }
