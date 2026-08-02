@@ -71,6 +71,43 @@ function sortByUrgency(stations) {
   });
 }
 
+// Distancia en km entre dos coordenadas (fórmula de Haversine, radio
+// terrestre promedio 6371km) — suficiente precisión para "estación más
+// cercana", no hace falta nada más elaborado para este caso de uso.
+function distanciaKm(lat1, lon1, lat2, lon2) {
+  const toRad = deg => (deg * Math.PI) / 180;
+  const R = 6371;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Busca, dentro del mismo listado de estaciones ya cargado (la categoría
+// abierta), la más cercana a `station` que SÍ tenga Caudal disponible —
+// para sugerirla cuando la estación actual no lo reportó. Requiere
+// coordenadas válidas en ambas puntas; si la estación actual no tiene
+// lat/lon, o ninguna otra estación del listado tiene Caudal, devuelve null
+// y el diálogo cae en el mensaje genérico de siempre.
+function estacionCercanaConCaudal(station, todasLasEstaciones) {
+  if (station.latitud == null || station.longitud == null) return null;
+  let mejor = null;
+  let mejorDistancia = Infinity;
+  for (const otra of todasLasEstaciones) {
+    if (otra.codigo === station.codigo) continue;
+    if (otra.detalle?.caudalM3s == null) continue;
+    if (otra.latitud == null || otra.longitud == null) continue;
+    const d = distanciaKm(station.latitud, station.longitud, otra.latitud, otra.longitud);
+    if (d < mejorDistancia) {
+      mejorDistancia = d;
+      mejor = otra;
+    }
+  }
+  return mejor ? { estacion: mejor, distanciaKm: mejorDistancia } : null;
+}
+
 // Agrupa estaciones por región para el panorama general del tablero.
 // Cada región lleva su propio conteo por severidad, y las regiones se
 // ordenan por urgencia: la que tenga alguna Roja primero, luego la que
@@ -544,7 +581,14 @@ export default function CentroMando() {
         </footer>
       </main>
 
-      {selected && <StationDialog station={selected} onClose={() => setSelected(null)} />}
+      {selected && (
+        <StationDialog
+          station={selected}
+          estacionesCategoria={sortedCategoria}
+          onClose={() => setSelected(null)}
+          onOpenStation={setSelected}
+        />
+      )}
       </>
       )}
     </div>
@@ -749,16 +793,22 @@ function StationCard({ station, index, onOpen }) {
             </p>
             <p className="font-mono text-[12px] font-medium text-[#9BAEA8]">umbral {station.umbral}{station.unidad}</p>
           </div>
-          {station.tendencia && <TendenciaTag tendencia={station.tendencia} />}
+          {station.tendencia && (
+            <div className="mt-2.5 pt-2.5 border-t border-white/[0.06]">
+              <TendenciaChip tendencia={station.tendencia} />
+            </div>
+          )}
         </div>
 
         {/* Caudal, si está disponible — bloque propio para que se note tanto como el nivel de agua */}
         {caudal != null && (
-          <div className="rounded-lg bg-[#0A1210]/40 border border-white/[0.06] px-3.5 py-2.5 mb-2.5 flex items-center justify-between">
-            <span className="text-[11px] font-semibold uppercase tracking-wide text-[#C7D3CE]">Caudal</span>
-            <span className="font-mono text-lg font-bold text-[#EDF2F0]">
-              {caudal} <span className="text-[12px] text-[#9BAEA8] font-medium">m³/seg</span>
-            </span>
+          <div className="rounded-lg bg-[#0A1210]/40 border border-white/[0.06] px-3.5 py-2.5 mb-2.5">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-semibold uppercase tracking-wide text-[#C7D3CE]">Caudal</span>
+              <span className="font-mono text-lg font-bold text-[#EDF2F0]">
+                {caudal} <span className="text-[12px] text-[#9BAEA8] font-medium">m³/seg</span>
+              </span>
+            </div>
           </div>
         )}
 
@@ -782,7 +832,7 @@ function StationCard({ station, index, onOpen }) {
 }
 
 // ---------- Station Detail Dialog ----------
-function StationDialog({ station, onClose }) {
+function StationDialog({ station, estacionesCategoria, onClose, onOpenStation }) {
   useEffect(() => {
     function onKey(e) { if (e.key === "Escape") onClose(); }
     window.addEventListener("keydown", onKey);
@@ -797,6 +847,15 @@ function StationDialog({ station, onClose }) {
   // petición). hayAlgunDetalle distingue ambos casos para mostrar un
   // mensaje preciso en vez de una grilla vacía y silenciosa.
   const hayAlgunDetalle = d && [d.caudalM3s, d.precipitacion24hMm, d.precipitacionAcumMm, d.alturaNieveCm, d.volumenLagoMillM3].some(v => v != null);
+
+  // Si esta estación no trajo Caudal (y sí se le pidió detalle — no es el
+  // caso Azul, que ni siquiera lo intenta), busca la estación con Caudal
+  // más cercana dentro de la misma categoría ya cargada, para sugerirla en
+  // vez de dejar un "no disponible" seco.
+  const sugerenciaCercana =
+    d && d.caudalM3s == null && station.tipoAlerta !== "Azul" && estacionesCategoria
+      ? estacionCercanaConCaudal(station, estacionesCategoria)
+      : null;
 
   const facts = [
     { label: "Estado de transmisión", value: station.estadoTransmision },
@@ -892,6 +951,28 @@ function StationDialog({ station, onClose }) {
             </div>
           )}
 
+          {/* Estación con Caudal más cercana — se muestra solo cuando ESTA
+              estación sí fue consultada por la DGA pero no reportó Caudal
+              (no aplica al caso "nunca se pidió detalle", donde tampoco
+              tiene sentido sugerir nada todavía). */}
+          {sugerenciaCercana && (
+            <button
+              onClick={() => onOpenStation(sugerenciaCercana.estacion)}
+              className="w-full text-left flex flex-col gap-1.5 rounded-lg bg-[#3B8FA3]/[0.08] border border-[#3B8FA3]/30 px-4 py-3 mb-4 hover:border-[#3B8FA3]/60 transition-colors"
+            >
+              <p className="text-[10px] font-bold uppercase tracking-widest text-[#7ECBDE]">Sugerencia cercana</p>
+              <p className="text-[12px] text-[#C7D3CE] leading-relaxed">
+                La DGA no tiene Caudal para esta estación en este momento, pero a{" "}
+                <span className="font-mono font-semibold text-[#EDF2F0]">{sugerenciaCercana.distanciaKm.toFixed(1)} km</span>{" "}
+                está <span className="font-semibold text-[#EDF2F0]">{sugerenciaCercana.estacion.nombre}</span> con{" "}
+                <span className="font-mono font-semibold text-[#7ECBDE]">{sugerenciaCercana.estacion.detalle.caudalM3s} m³/seg</span>.
+              </p>
+              <span className="text-[11px] font-mono font-semibold text-[#7ECBDE] flex items-center gap-1">
+                Ver ficha de {sugerenciaCercana.estacion.nombre} <ExternalLink className="w-3 h-3" />
+              </span>
+            </button>
+          )}
+
           {/* Ficha técnica */}
           <div className="space-y-2 mb-5">
             {facts.map(f => (
@@ -969,5 +1050,38 @@ function TendenciaTag({ tendencia }) {
         <span className="text-[#5C726A] font-normal">· hace {minutosTranscurridos} min</span>
       )}
     </p>
+  );
+}
+
+// Variante "chip" de TendenciaTag — mismo dato, pero con fondo de color
+// propio en vez de solo texto, para que no compita visualmente y se pierda
+// al lado de números grandes (Nivel de Agua, Caudal) como pasaba antes en
+// las tarjetas de la grilla. Se usa en StationCard; el diálogo de detalle
+// sigue usando la versión de texto simple (TendenciaTag) porque ahí ya
+// tiene su propio espacio dedicado y no compite con nada.
+function TendenciaChip({ tendencia }) {
+  const { direccion, porcentaje, diferenciaMetros, timestampAnterior } = tendencia;
+  const config = {
+    subiendo: { icon: "↑", text: "text-[#F5C876]", bg: "bg-[#E8A33D]/15", border: "border-[#E8A33D]/40", label: "Subiendo" },
+    bajando: { icon: "↓", text: "text-[#7ECBDE]", bg: "bg-[#3B8FA3]/15", border: "border-[#3B8FA3]/40", label: "Bajando" },
+    estable: { icon: "→", text: "text-[#9BAEA8]", bg: "bg-white/[0.04]", border: "border-white/10", label: "Estable" },
+  }[direccion] || { icon: "→", text: "text-[#9BAEA8]", bg: "bg-white/[0.04]", border: "border-white/10", label: "Estable" };
+
+  const minutosTranscurridos = timestampAnterior
+    ? Math.max(1, Math.round((Date.now() - new Date(timestampAnterior).getTime()) / 60000))
+    : null;
+
+  return (
+    <span className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 font-mono text-[11px] font-bold ${config.bg} ${config.border} ${config.text}`}>
+      <span className="text-[13px] leading-none">{config.icon}</span>
+      {config.label}
+      {porcentaje != null && ` ${Math.abs(porcentaje)}%`}
+      {diferenciaMetros != null && direccion !== "estable" && (
+        <span className="opacity-70 font-normal">({diferenciaMetros > 0 ? "+" : ""}{diferenciaMetros}m)</span>
+      )}
+      {minutosTranscurridos != null && (
+        <span className="opacity-60 font-normal">· {minutosTranscurridos}m</span>
+      )}
+    </span>
   );
 }
