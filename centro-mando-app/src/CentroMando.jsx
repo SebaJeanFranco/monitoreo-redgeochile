@@ -245,6 +245,18 @@ async function loadHistoricoEstacion(codigo) {
   return res.json();
 }
 
+// Resumen nacional por corrida del cron (total + desglose por color en las
+// últimas horas) — se pide una vez al cargar el dashboard, junto con la
+// carga básica. Requiere Worker configurado (necesita leer Sheets); sin
+// Worker el panel de tendencia nacional simplemente no se muestra.
+async function loadResumenNacional() {
+  if (!WORKER_URL) return null;
+  const endpoint = `${WORKER_URL.replace(/\/$/, "")}/resumen`;
+  const res = await fetch(endpoint, { cache: "no-store" });
+  if (!res.ok) throw new Error(`El Worker respondió con error (HTTP ${res.status}).`);
+  return res.json();
+}
+
 export default function CentroMando() {
   // `data`: resultado de la carga básica inicial (todas las categorías,
   // SIN Caudal) — es lo que alimenta los conteos, el desglose regional y
@@ -276,6 +288,14 @@ export default function CentroMando() {
   // vieja a datos de estaciones nuevos.
   const [caudalPorEstacion, setCaudalPorEstacion] = useState({});
 
+  // Resumen nacional por corrida del cron — total + desglose por color en
+  // las últimas horas, para el gráfico de tendencia debajo del panorama
+  // nacional. Se carga en paralelo con la carga básica, sin bloquearla: si
+  // esto falla (Sheets caído, sin Worker, etc.), el resto del dashboard
+  // sigue funcionando igual — el gráfico simplemente no aparece.
+  const [resumenNacional, setResumenNacional] = useState(null);
+  const [resumenNacionalError, setResumenNacionalError] = useState(null);
+
   async function refresh() {
     setLoading(true);
     setError(null);
@@ -296,6 +316,18 @@ export default function CentroMando() {
       );
     } finally {
       setLoading(false);
+    }
+
+    // Resumen nacional: independiente de la carga básica de arriba, no
+    // comparte try/catch ni estado de loading con ella — un fallo acá no
+    // debe mostrarse como error general del dashboard.
+    setResumenNacional(null);
+    setResumenNacionalError(null);
+    try {
+      const json = await loadResumenNacional();
+      setResumenNacional(json);
+    } catch (e) {
+      setResumenNacionalError(e.message || "Error desconocido");
     }
   }
 
@@ -545,6 +577,17 @@ export default function CentroMando() {
               </p>
             </div>
           </div>
+
+          {/* Tendencia nacional — total + desglose por color en las
+              últimas horas, a partir del histórico que guarda el cron en
+              Sheets cada 30 min. Independiente del resto: si falla o no
+              hay Worker, no aparece, sin afectar nada más del panel. */}
+          {(resumenNacional?.corridas?.length > 1 || resumenNacionalError) && (
+            <div className="mt-5">
+              <p className="text-[11px] uppercase tracking-widest text-[#9BAEA8] font-bold mb-3">Tendencia nacional — últimas 6 horas</p>
+              <TendenciaNacionalChart corridas={resumenNacional?.corridas} error={resumenNacionalError} />
+            </div>
+          )}
 
           {/* Desglose por región */}
           {byRegion.length > 0 && (
@@ -1357,6 +1400,113 @@ function Stat({ label, value, unit }) {
       <p className="font-mono text-base font-semibold text-[#7ECBDE]">
         {value}<span className="text-[11px] text-[#9BAEA8] font-normal ml-1">{unit}</span>
       </p>
+    </div>
+  );
+}
+
+// ---------- Tendencia nacional (panorama general) ----------
+// Total de alertas + desglose por color, en las últimas 6 horas, a partir
+// de las corridas del cron guardadas en Sheets (ver /resumen en
+// worker.js). El total va arriba como número grande con variación desde
+// el inicio de la ventana; el desglose por color va abajo como mini
+// gráfico de 3 líneas — mismo criterio SVG a mano que HistoricoChart, sin
+// agregar una librería de gráficos para esto.
+const HORAS_VENTANA_TENDENCIA = 6;
+
+function TendenciaNacionalChart({ corridas, error }) {
+  if (error) {
+    return (
+      <div className="rounded-lg bg-[#0F1B18] border border-[#1E332C] px-4 py-3">
+        <p className="text-[12px] text-[#9BAEA8]">No se pudo cargar la tendencia: {error}</p>
+      </div>
+    );
+  }
+
+  const ahora = Date.now();
+  const ventanaMs = HORAS_VENTANA_TENDENCIA * 60 * 60 * 1000;
+  const enVentana = (corridas || []).filter(c => ahora - new Date(c.timestamp).getTime() <= ventanaMs);
+
+  if (enVentana.length < 2) {
+    return (
+      <div className="rounded-lg bg-[#0F1B18] border border-[#1E332C] px-4 py-3">
+        <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
+          Todavía no hay suficiente histórico guardado para mostrar la tendencia — el cron guarda una corrida cada 30 min, volvé a revisar más tarde.
+        </p>
+      </div>
+    );
+  }
+
+  const primero = enVentana[0];
+  const ultimo = enVentana[enVentana.length - 1];
+  const variacionTotal = ultimo.total - primero.total;
+
+  // Layout del SVG — igual criterio que HistoricoChart.
+  const W = 600, H = 130, padL = 28, padR = 12, padT = 10, padB = 20;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+
+  const times = enVentana.map(c => new Date(c.timestamp).getTime());
+  const tMin = Math.min(...times);
+  const tMax = Math.max(...times);
+  const tRango = Math.max(tMax - tMin, 1);
+
+  const series = [
+    { key: "Roja", color: "#FF8B6B" },
+    { key: "Amarilla", color: "#F5C876" },
+    { key: "Azul", color: "#7ECBDE" },
+  ];
+  const maxY = Math.max(1, ...enVentana.flatMap(c => series.map(s => c[s.key] || 0)));
+
+  function x(i) { return padL + (plotW * (times[i] - tMin)) / tRango; }
+  function y(v) { return padT + plotH - (plotH * v) / maxY; }
+
+  const fmtHora = ts => new Date(ts).toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" });
+
+  return (
+    <div className="rounded-lg bg-[#0F1B18] border border-[#1E332C] px-4 py-4">
+      {/* Total grande + variación en la ventana */}
+      <div className="flex items-end justify-between mb-3">
+        <div>
+          <p className="font-display font-bold text-[32px] leading-none text-white">{ultimo.total}</p>
+          <p className="text-[10px] uppercase tracking-widest text-[#7C8F88] font-semibold mt-1">Total en alerta ahora</p>
+        </div>
+        {variacionTotal !== 0 && (
+          <p className={`font-mono text-[13px] font-bold ${variacionTotal > 0 ? "text-[#F5C876]" : "text-[#7ECBDE]"}`}>
+            {variacionTotal > 0 ? "↑" : "↓"} {Math.abs(variacionTotal)} desde las {fmtHora(primero.timestamp)}
+          </p>
+        )}
+        {variacionTotal === 0 && (
+          <p className="font-mono text-[13px] font-bold text-[#9BAEA8]">→ Estable desde las {fmtHora(primero.timestamp)}</p>
+        )}
+      </div>
+
+      {/* Mini gráfico de 3 líneas — desglose por color */}
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" preserveAspectRatio="none" style={{ height: 130 }}>
+        {[0, maxY / 2, maxY].map((v, i) => (
+          <line key={i} x1={padL} x2={W - padR} y1={y(v)} y2={y(v)} stroke="#1E332C" strokeWidth="1" />
+        ))}
+        {series.map(s => {
+          const path = enVentana
+            .map((c, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(c[s.key] || 0).toFixed(1)}`)
+            .join(" ");
+          return <path key={s.key} d={path} fill="none" stroke={s.color} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />;
+        })}
+      </svg>
+
+      {/* Leyenda + rango de tiempo */}
+      <div className="flex items-center justify-between mt-1">
+        <div className="flex items-center gap-3">
+          {series.map(s => (
+            <span key={s.key} className="flex items-center gap-1.5 font-mono text-[10px] font-semibold" style={{ color: s.color }}>
+              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: s.color }} />
+              {s.key} {enVentana[enVentana.length - 1][s.key] || 0}
+            </span>
+          ))}
+        </div>
+        <span className="font-mono text-[10px] text-[#7C8F88]">
+          {fmtHora(primero.timestamp)} – {fmtHora(ultimo.timestamp)}
+        </span>
+      </div>
     </div>
   );
 }

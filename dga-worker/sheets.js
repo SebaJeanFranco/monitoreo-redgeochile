@@ -420,3 +420,25 @@ export function historicoPorCodigo(allRows, codigo) {
     .filter(r => r.codigo === codigo)
     .sort((a, b) => (a.timestamp || "").localeCompare(b.timestamp || ""));
 }
+
+// Resumen nacional por corrida del cron: cuenta cuántas estaciones había
+// en alerta de cada color en cada `timestamp` guardado. Todas las filas de
+// una misma corrida comparten el mismo timestamp exacto (se genera una
+// sola vez por llamada a appendSnapshotRows), así que agrupar por ese
+// campo reconstruye "una fila por corrida" sin tener que guardar el
+// conteo agregado aparte — se deriva del mismo histórico que ya existía.
+// Devuelve un array ordenado cronológicamente ascendente:
+// [{ timestamp, total, Roja, Amarilla, Azul }, ...]
+export function resumenPorCorrida(allRows) {
+  const porTimestamp = new Map();
+  for (const r of allRows) {
+    if (!r.timestamp) continue;
+    if (!porTimestamp.has(r.timestamp)) {
+      porTimestamp.set(r.timestamp, { timestamp: r.timestamp, total: 0, Roja: 0, Amarilla: 0, Azul: 0 });
+    }
+    const entry = porTimestamp.get(r.timestamp);
+    entry.total++;
+    if (entry[r.tipoAlerta] != null) entry[r.tipoAlerta]++;
+  }
+  return [...porTimestamp.values()].sort((a, b) => (a.timestamp || "").localeCompare(b.timestamp || ""));
+}

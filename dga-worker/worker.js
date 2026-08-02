@@ -45,7 +45,7 @@
  * Sheets ni de credenciales.
  */
 
-import { appendSnapshotRows, appendLogRows, readAllSnapshotRows, findLatestPreviousByCode, historicoPorCodigo } from "./sheets.js";
+import { appendSnapshotRows, appendLogRows, readAllSnapshotRows, findLatestPreviousByCode, historicoPorCodigo, resumenPorCorrida } from "./sheets.js";
 
 const SNIA_URL = "https://snia.mop.gob.cl/sat/site/informes/mapas/mapas.xhtml";
 
@@ -606,6 +606,22 @@ async function handleHistoricoEstacion(url, env) {
   return { codigo, puntos };
 }
 
+// -----------------------------------------------------------------------
+// Resumen nacional por corrida del cron — endpoint /resumen. Cuenta, para
+// cada corrida guardada en Sheets, cuántas estaciones había en alerta de
+// cada color — pensado para el panorama general del dashboard (total +
+// desglose Roja/Amarilla/Azul en las últimas horas). Con el cron cada 30
+// min, 6 horas de histórico son ~12 corridas; se pide maxRows más alto que
+// el de la tendencia individual (500) porque acá hace falta cubrir varias
+// corridas completas con margen para días de muchas alertas a la vez,
+// no solo la corrida más reciente de una estación puntual.
+// -----------------------------------------------------------------------
+async function handleResumenNacional(env) {
+  const allRows = await readAllSnapshotRows(env, 1500);
+  const corridas = resumenPorCorrida(allRows);
+  return { corridas };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -629,6 +645,7 @@ export default {
           "/alertas?all=1",
           "/caudal?codigo=XXXXXXX-X&tipoEstacion=Fluviometricas",
           "/historico?codigo=XXXXXXX-X",
+          "/resumen",
         ],
       });
     }
@@ -654,6 +671,15 @@ export default {
     if (url.pathname === "/historico") {
       try {
         const data = await handleHistoricoEstacion(url, env);
+        return jsonResponse(data);
+      } catch (e) {
+        return jsonResponse({ error: e.message || "Error desconocido" }, 502);
+      }
+    }
+
+    if (url.pathname === "/resumen") {
+      try {
+        const data = await handleResumenNacional(env);
         return jsonResponse(data);
       } catch (e) {
         return jsonResponse({ error: e.message || "Error desconocido" }, 502);
