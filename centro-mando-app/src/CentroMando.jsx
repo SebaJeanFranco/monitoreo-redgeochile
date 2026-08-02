@@ -461,7 +461,9 @@ export default function CentroMando() {
         )}
 
         {/* 3 botones grandes por categoría — el detalle (con Caudal) de
-            cada una se pide recién al pincharlo, no de entrada. */}
+            cada una se pide recién al pincharlo, no de entrada. Mientras
+            una categoría está cargando, los otros dos botones se bloquean
+            para no disparar varias consultas a la DGA en paralelo. */}
         {sorted.length > 0 && (
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-8">
             <CategoryButton
@@ -469,6 +471,7 @@ export default function CentroMando() {
               label="Revisar alertas Rojas"
               count={counts.Roja}
               active={categoriaAbierta === "Roja"}
+              blocked={loadingCategoria}
               onClick={() => (categoriaAbierta === "Roja" ? cerrarCategoria() : abrirCategoria("Roja"))}
             />
             <CategoryButton
@@ -476,6 +479,7 @@ export default function CentroMando() {
               label="Revisar alertas Amarillas"
               count={counts.Amarilla}
               active={categoriaAbierta === "Amarilla"}
+              blocked={loadingCategoria}
               onClick={() => (categoriaAbierta === "Amarilla" ? cerrarCategoria() : abrirCategoria("Amarilla"))}
             />
             <CategoryButton
@@ -483,6 +487,7 @@ export default function CentroMando() {
               label="Revisar alertas Azules"
               count={counts.Azul}
               active={categoriaAbierta === "Azul"}
+              blocked={loadingCategoria}
               onClick={() => (categoriaAbierta === "Azul" ? cerrarCategoria() : abrirCategoria("Azul"))}
             />
           </div>
@@ -577,29 +582,34 @@ function RegionFigure({ count, styleKey }) {
 // Rojas/Amarillas/Azules"). Al pincharlo se pide recién ahí el detalle
 // (con Caudal) de esa categoría — antes de eso solo se sabe el conteo,
 // que viene de la carga básica inicial.
-function CategoryButton({ styleKey, label, count, active, onClick }) {
+function CategoryButton({ styleKey, label, count, active, blocked, onClick }) {
   const s = ALERT_STYLES[styleKey];
-  const disabled = count === 0;
+  const disabled = count === 0 || blocked;
+  // El botón activo que está cargando su propia categoría se deshabilita
+  // igual (no se puede cerrar a mitad de la consulta), pero mantiene su
+  // color distintivo — apagarlo justo cuando el usuario más necesita ver
+  // cuál categoría está cargando sería confuso.
+  const colorApagado = disabled && !(blocked && active);
   return (
     <button
       onClick={onClick}
       disabled={disabled}
       className={`rounded-xl border-2 px-5 py-6 text-left transition-all ${
-        disabled
+        colorApagado
           ? "border-[#1E332C] bg-[#0F1B18] opacity-50 cursor-not-allowed"
           : active
-            ? `${s.border} ${s.bg} -translate-y-0.5`
+            ? `${s.border} ${s.bg} -translate-y-0.5 ${disabled ? "cursor-not-allowed" : ""}`
             : `${s.borderSoft} bg-[#0F1B18] hover:-translate-y-0.5 ${s.hoverBg}`
       }`}
     >
       <div className="flex items-center justify-between mb-2">
-        <span className={`font-mono text-[11px] font-bold uppercase tracking-widest ${disabled ? "text-[#5C726A]" : s.text}`}>
+        <span className={`font-mono text-[11px] font-bold uppercase tracking-widest ${colorApagado ? "text-[#5C726A]" : s.text}`}>
           {styleKey}
         </span>
         {styleKey === "Roja" && count > 0 && <span className="w-2 h-2 rounded-full bg-[#FF8B6B] dot-pulse" />}
       </div>
       <p className="font-display font-bold text-[20px] text-white leading-tight mb-1">{label}</p>
-      <p className={`font-display font-bold text-[36px] leading-none ${disabled ? "text-[#3C5850]" : s.text}`}>
+      <p className={`font-display font-bold text-[36px] leading-none ${colorApagado ? "text-[#3C5850]" : s.text}`}>
         {count}
         <span className="font-mono text-[13px] font-normal text-[#7C8F88] ml-2">
           {count === 1 ? "estación" : "estaciones"}
@@ -608,6 +618,17 @@ function CategoryButton({ styleKey, label, count, active, onClick }) {
       {!disabled && (
         <p className="font-mono text-[11px] text-[#7C8F88] mt-3">
           {active ? "Tocá para cerrar ↑" : "Tocá para ver detalle y Caudal →"}
+        </p>
+      )}
+      {blocked && active && (
+        <p className={`font-mono text-[11px] mt-3 flex items-center gap-1.5 ${s.text}`}>
+          <RefreshCw className="w-3 h-3 animate-spin" />
+          Consultando Caudal...
+        </p>
+      )}
+      {blocked && !active && (
+        <p className="font-mono text-[11px] text-[#5C726A] mt-3">
+          Esperá a que termine la consulta actual...
         </p>
       )}
     </button>
