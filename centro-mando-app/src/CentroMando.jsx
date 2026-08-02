@@ -132,6 +132,30 @@ function groupByRegion(stations) {
   });
 }
 
+// Variación de una región en las últimas horas — mismo criterio que
+// TendenciaNacionalChart: compara el conteo actual contra la corrida más
+// antigua dentro de la ventana (no la corrida inmediata anterior), para
+// mostrar "cuánto cambió en las últimas N horas" de forma consistente con
+// el gráfico de tendencia nacional. Devuelve null si no hay suficiente
+// histórico para esa región todavía (recién apareció en alerta, o el cron
+// no acumuló corridas para ella).
+const HORAS_VENTANA_VARIACION_REGION = 6;
+
+function calcularVariacionRegion(regionNombre, totalActual, corridasPorRegion) {
+  const serie = corridasPorRegion?.[regionNombre];
+  if (!serie || serie.length < 2) return null;
+
+  const ahora = Date.now();
+  const ventanaMs = HORAS_VENTANA_VARIACION_REGION * 60 * 60 * 1000;
+  const enVentana = serie.filter(c => ahora - new Date(c.timestamp).getTime() <= ventanaMs);
+  if (enVentana.length < 2) return null;
+
+  const primero = enVentana[0];
+  const diferencia = totalActual - primero.total;
+  const minutosTranscurridos = Math.max(1, Math.round((ahora - new Date(primero.timestamp).getTime()) / 60000));
+  return { diferencia, minutosTranscurridos };
+}
+
 // Emoji de severidad para el informe de texto — mismo criterio de color
 // que el resto del dashboard, en formato que se pueda pegar directo en
 // Instagram/WhatsApp/lo que sea (no HTML, no Markdown — texto plano con
@@ -150,6 +174,37 @@ const EMOJI_ALERTA = { Roja: "🔴", Amarilla: "🟡", Azul: "🔵" };
 // del dashboard ("Alerta Roja") pero acá la palabra que acompaña es
 // "umbral", que es masculino.
 const UMBRAL_MASCULINO = { Roja: "rojo", Amarilla: "amarillo", Azul: "azul" };
+
+// Palabras que quedan en minúscula en el nombre de una estación (salvo que
+// sean la primera palabra) — preposiciones y artículos típicos de los
+// nombres de la DGA ("RIO ITATA EN BALSA NUEVA ALDEA" → "Río Itata en
+// Balsa Nueva Aldea", no "... En Balsa ...").
+const PALABRAS_MINUSCULA = new Set(["en", "de", "del", "la", "las", "el", "los", "y", "a", "ex"]);
+
+// Siglas/abreviaturas que se mantienen tal cual vienen (todo mayúscula),
+// sin aplicarles el formato Título — la DGA las usa como prefijo en
+// algunos nombres (ej. "PCF RIO ITATA EN PUENTE COELEMU").
+const SIGLAS_LITERALES = new Set(["pcf"]);
+
+// La DGA entrega los nombres de estación TODO EN MAYÚSCULAS ("RIO TEMUCO
+// EN TEMUCO") — para el informe de texto (pensado para copiar/pegar en
+// redes) se convierte a formato Título más legible ("Río Temuco en
+// Temuco"). Solo afecta el texto del informe: en el resto del dashboard
+// (tarjetas, diálogo de detalle) el nombre se sigue mostrando tal cual
+// viene de la DGA, sin tocar.
+function tituloLegible(nombre) {
+  if (!nombre) return nombre;
+  return nombre
+    .toLowerCase()
+    .split(" ")
+    .map((palabra, i) => {
+      if (!palabra) return palabra;
+      if (SIGLAS_LITERALES.has(palabra)) return palabra.toUpperCase();
+      if (i > 0 && PALABRAS_MINUSCULA.has(palabra)) return palabra;
+      return palabra.charAt(0).toUpperCase() + palabra.slice(1);
+    })
+    .join(" ");
+}
 
 function generarInformeTexto(stations, generadoEn) {
   const porRegion = new Map();
@@ -197,8 +252,9 @@ function generarInformeTexto(stations, generadoEn) {
       // cada línea innecesariamente cuando no hay dato.
       const caudal = s.detalle?.caudalM3s;
       const caudalTexto = caudal != null ? ` Caudal: ${caudal} m³/seg.` : "";
+      const nombreLegible = tituloLegible(s.nombre);
       lineas.push(
-        `${emoji} ${s.nombre}: Superó el umbral ${colorUmbral} con un nivel de aguas de ${s.valorMedicion} ${s.unidad || "m"}, lo que equivale a ${excesoTexto} sobre el umbral.${caudalTexto}`
+        `${emoji} ${nombreLegible}: Superó el umbral ${colorUmbral} con un nivel de aguas de ${s.valorMedicion} ${s.unidad || "m"}, lo que equivale a ${excesoTexto} sobre el umbral.${caudalTexto}`
       );
     }
     lineas.push("");
@@ -793,21 +849,44 @@ export default function CentroMando() {
             <div className="mt-5">
               <p className="text-[11px] uppercase tracking-widest text-[#9BAEA8] font-bold mb-3">Por región</p>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
-                {byRegion.map(r => (
-                  <div
-                    key={r.region}
-                    className="rounded-lg border border-[#1E332C] bg-[#0F1B18] px-4 py-3"
-                  >
-                    <p className="font-display font-semibold text-[16px] text-[#EDF2F0] leading-tight mb-2.5 truncate" title={r.region}>
-                      {r.region}
-                    </p>
-                    <div className="flex items-center gap-4">
-                      <RegionFigure count={r.Roja} styleKey="Roja" />
-                      <RegionFigure count={r.Amarilla} styleKey="Amarilla" />
-                      <RegionFigure count={r.Azul} styleKey="Azul" />
+                {byRegion.map(r => {
+                  const variacion = calcularVariacionRegion(r.region, r.total, resumenNacional?.corridasPorRegion);
+                  return (
+                    <div
+                      key={r.region}
+                      className="rounded-lg border border-[#1E332C] bg-[#0F1B18] px-4 py-3"
+                    >
+                      <div className="flex items-start justify-between gap-2 mb-2.5">
+                        <p className="font-display font-semibold text-[16px] text-[#EDF2F0] leading-tight truncate" title={r.region}>
+                          {r.region}
+                        </p>
+                        {variacion && variacion.diferencia !== 0 && (
+                          <span
+                            className={`flex-shrink-0 font-mono text-[11px] font-bold ${
+                              variacion.diferencia > 0 ? "text-[#F5C876]" : "text-[#7ECBDE]"
+                            }`}
+                            title={`Hace ${variacion.minutosTranscurridos} min había ${r.total - variacion.diferencia} en alerta`}
+                          >
+                            {variacion.diferencia > 0 ? "↑" : "↓"} {Math.abs(variacion.diferencia)}
+                          </span>
+                        )}
+                        {variacion && variacion.diferencia === 0 && (
+                          <span className="flex-shrink-0 font-mono text-[11px] font-bold text-[#5C726A]">→</span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-4">
+                        <RegionFigure count={r.Roja} styleKey="Roja" />
+                        <RegionFigure count={r.Amarilla} styleKey="Amarilla" />
+                        <RegionFigure count={r.Azul} styleKey="Azul" />
+                      </div>
+                      {variacion && (
+                        <p className="font-mono text-[10px] text-[#5C726A] mt-2">
+                          vs. hace {variacion.minutosTranscurridos} min
+                        </p>
+                      )}
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}
@@ -1688,7 +1767,7 @@ const SERIES_TENDENCIA = [
 // estado de filtro (aislar una serie en el diálogo no debe afectar la
 // vista chica de atrás, y viceversa).
 function useTendenciaData(corridas, horasVentana) {
-  const [seriesActivas, setSeriesActivas] = useState({ Total: true, Roja: true, Amarilla: true, Azul: true });
+  const [seriesActivas, setSeriesActivas] = useState({ Total: false, Roja: true, Amarilla: true, Azul: true });
 
   function toggleSerie(key) {
     setSeriesActivas(prev => {
