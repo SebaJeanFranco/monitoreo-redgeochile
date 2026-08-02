@@ -45,7 +45,7 @@
  * Sheets ni de credenciales.
  */
 
-import { appendSnapshotRows, readAllSnapshotRows, findLatestPreviousByCode } from "./sheets.js";
+import { appendSnapshotRows, appendLogRows, readAllSnapshotRows, findLatestPreviousByCode } from "./sheets.js";
 
 const SNIA_URL = "https://snia.mop.gob.cl/sat/site/informes/mapas/mapas.xhtml";
 
@@ -93,6 +93,31 @@ function jsonResponse(data, status = 200) {
     status,
     headers: { "Content-Type": "application/json; charset=utf-8", ...CORS_HEADERS },
   });
+}
+
+// -----------------------------------------------------------------------
+// Colector de logs de diagnóstico: junta los mensajes de una corrida en un
+// array simple para mandarlos todos juntos a la hoja "LOG" al final (ver
+// appendLogRows() en sheets.js) — una sola petición HTTP a Sheets por
+// corrida, en vez de una por mensaje. También escribe cada mensaje a
+// console.log/console.error como antes, así el stream de Logs de
+// Cloudflare (para quien lo tenga abierto en vivo) sigue mostrando todo
+// igual que antes; Sheets es un respaldo consultable después, no un
+// reemplazo del stream en vivo.
+// -----------------------------------------------------------------------
+function makeLogCollector() {
+  const entries = [];
+  return {
+    log(mensaje) {
+      console.log(mensaje);
+      entries.push({ nivel: "info", mensaje });
+    },
+    error(mensaje) {
+      console.error(mensaje);
+      entries.push({ nivel: "error", mensaje });
+    },
+    entries,
+  };
 }
 
 // -----------------------------------------------------------------------
@@ -223,7 +248,7 @@ async function getViewState() {
   return { viewState: match[1], cookie };
 }
 
-async function requestStationDetail(viewState, cookie, codigo, param2) {
+async function requestStationDetail(viewState, cookie, codigo, param2, logger) {
   const body = new URLSearchParams({
     "medicionesByTypeFunctions": "medicionesByTypeFunctions",
     "javax.faces.ViewState": viewState,
@@ -249,7 +274,10 @@ async function requestStationDetail(viewState, cookie, codigo, param2) {
   if (cookie) headers["Cookie"] = cookie;
 
   const resp = await fetch(SNIA_URL, { method: "POST", headers, body: body.toString() });
-  if (!resp.ok) return null;
+  if (!resp.ok) {
+    logger.log(`[detalle] ${codigo}: HTTP ${resp.status} en el POST de detalle (param2="${param2 || ""}")`);
+    return null;
+  }
   const text = await resp.text();
 
   const result = {};
@@ -258,6 +286,15 @@ async function requestStationDetail(viewState, cookie, codigo, param2) {
     const m = text.match(pattern);
     if (m) { anyFound = true; result[key] = parseClNumber(m[1]); }
     else { result[key] = null; }
+  }
+  if (!anyFound) {
+    logger.log(`[detalle] ${codigo}: respuesta OK pero sin ninguna variable esperada en el <script> (param2="${param2 || ""}", ${text.length} bytes recibidos)`);
+  } else if (result.caudalM3s == null) {
+    // Puede ser normal (la estación no mide Caudal, solo Precipitación/Nieve/etc.)
+    // o puede ser el mismo problema de "no calzó" pero afectando solo esta
+    // variable puntual — se deja registrado para poder diferenciarlo con
+    // varias corridas en los logs, en vez de asumir una causa sin dato.
+    logger.log(`[detalle] ${codigo}: trajo detalle pero SIN Caudal (otros campos: ${JSON.stringify(result)})`);
   }
   return anyFound ? result : null;
 }
@@ -273,10 +310,15 @@ async function requestStationDetail(viewState, cookie, codigo, param2) {
 // reintenta una vez sin param2 (vacío) — que en las capturas de red
 // originales no siempre resultó estrictamente necesario para que el
 // servidor identifique la estación por su código.
-async function fetchStationDetail(viewState, cookie, codigo, tipoEstacion) {
-  const first = await requestStationDetail(viewState, cookie, codigo, tipoEstacion);
+async function fetchStationDetail(viewState, cookie, codigo, tipoEstacion, logger) {
+  const first = await requestStationDetail(viewState, cookie, codigo, tipoEstacion, logger);
   if (first != null) return first;
-  return requestStationDetail(viewState, cookie, codigo, "");
+  logger.log(`[detalle] ${codigo}: primer intento (param2="${tipoEstacion || ""}") sin datos, reintentando con param2 vacío...`);
+  const second = await requestStationDetail(viewState, cookie, codigo, "", logger);
+  if (second == null) {
+    logger.log(`[detalle] ${codigo}: reintento también sin datos — la estación queda sin detalle esta corrida.`);
+  }
+  return second;
 }
 
 function sleep(ms) {
@@ -289,7 +331,7 @@ function sleep(ms) {
 // tuvo que revertirse.
 const DETALLE_DELAY_MS = 700;
 
-async function fetchDetalleEnLotes(stations, viewState, cookie) {
+async function fetchDetalleEnLotes(stations, viewState, cookie, logger) {
   // Nota histórica importante: esta función se llamó "EnLotes" porque en un
   // momento pedía el detalle de varias estaciones EN PARALELO (lotes de 5,
   // con Promise.allSettled) para acelerar la carga de ~20-25s a ~5-8s. Se
@@ -327,21 +369,34 @@ async function fetchDetalleEnLotes(stations, viewState, cookie) {
   for (let i = 0; i < stations.length; i++) {
     const s = stations[i];
     try {
-      s.detalle = await fetchStationDetail(viewState, cookie, s.codigo, s.tipoEstacion);
+      s.detalle = await fetchStationDetail(viewState, cookie, s.codigo, s.tipoEstacion, logger);
     } catch (e) {
       // Fallo de red/excepción real (timeout, conexión cortada, etc.) — no
       // el caso de "respuesta vacía sin error" que ya maneja el reintento
       // de param2 dentro de fetchStationDetail(). Un solo reintento extra
       // acá cubre errores transitorios puntuales sin alargar demasiado el
       // resto de la carga si es un fallo persistente.
+      logger.log(`[detalle] ${s.codigo}: excepción de red en el primer intento (${e.message || e}), reintentando...`);
       try {
-        s.detalle = await fetchStationDetail(viewState, cookie, s.codigo, s.tipoEstacion);
+        s.detalle = await fetchStationDetail(viewState, cookie, s.codigo, s.tipoEstacion, logger);
       } catch (e2) {
+        logger.log(`[detalle] ${s.codigo}: excepción de red también en el reintento (${e2.message || e2}) — queda sin detalle.`);
         s.detalle = null;
       }
     }
     if (i < stations.length - 1) await sleep(DETALLE_DELAY_MS);
   }
+
+  // Resumen final de la corrida — visible en Logs de Cloudflare sin tener
+  // que contar manualmente entre todas las líneas de arriba. Distingue
+  // "sin detalle en absoluto" (ninguna variable, ver mensaje de arriba)
+  // de "detalle sí, pero sin Caudal puntual" (la estación puede no medir
+  // Caudal, o el servidor no lo entregó esta vez).
+  const totalPedidas = stations.length;
+  const sinDetalleAlguno = stations.filter(s => s.detalle == null).length;
+  const conDetalleSinCaudal = stations.filter(s => s.detalle != null && s.detalle.caudalM3s == null).length;
+  const conCaudal = stations.filter(s => s.detalle?.caudalM3s != null).length;
+  logger.log(`[detalle] Resumen: ${totalPedidas} estaciones consultadas · ${conCaudal} con Caudal · ${conDetalleSinCaudal} con detalle pero sin Caudal · ${sinDetalleAlguno} sin detalle alguno.`);
 }
 
 const COLORES_VALIDOS = ["Roja", "Amarilla", "Azul"];
@@ -423,14 +478,20 @@ async function handleAlertas(url, env) {
   const sinDetallePorNivel = outputStations.length - elegiblesParaDetalle.length;
 
   if (wantDetalle) {
+    const logger = makeLogCollector();
     const target = elegiblesParaDetalle.slice(0, MAX_DETALLE_STATIONS);
+    const cortadasPorLimite = elegiblesParaDetalle.length - target.length;
+    if (cortadasPorLimite > 0) {
+      logger.log(`[detalle] Límite de ${MAX_DETALLE_STATIONS} alcanzado: ${cortadasPorLimite} estaciones elegibles quedaron SIN consultar Caudal esta corrida (categoría: ${colorFiltro ? colorFiltro[0] : "Roja+Amarilla"}).`);
+    }
     try {
       const { viewState, cookie } = await getViewState();
-      await fetchDetalleEnLotes(target, viewState, cookie);
+      await fetchDetalleEnLotes(target, viewState, cookie, logger);
     } catch (e) {
       // Si falla obtener el ViewState (p.ej. la DGA cambió el sitio), se
       // sigue devolviendo las alertas básicas sin detalle, en vez de fallar
       // toda la respuesta.
+      logger.error(`[detalle] No se pudo obtener el ViewState: ${e.message || e}`);
     }
 
     // Tendencia contra el histórico de Sheets: solo cuando el usuario abrió
@@ -452,6 +513,19 @@ async function handleAlertas(url, env) {
         // romper toda la respuesta por un dato secundario — las
         // estaciones simplemente quedan sin `tendencia`, el dashboard ya
         // maneja su ausencia sin problema.
+      }
+    }
+
+    // Manda todos los mensajes juntados durante esta corrida a la hoja
+    // "LOG" en una sola petición. Si esto falla (Sheets caído, cuota,
+    // etc.), no debe romper la respuesta al dashboard — el usuario ya
+    // tiene sus datos de Caudal, perder el log de diagnóstico de ESTA
+    // corrida puntual no es motivo para fallar toda la petición.
+    if (logger.entries.length > 0) {
+      try {
+        await appendLogRows(env, logger.entries);
+      } catch (e) {
+        console.error("[sheets] No se pudo escribir el log de diagnóstico en LOG:", e.message || e);
       }
     }
   }

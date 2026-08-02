@@ -132,31 +132,40 @@ const HEADER_ROW = [
   "nivelAlerta", "valorMedicion", "umbral", "regionNombreAprox",
 ];
 
-// Cachea en memoria del propio Worker si ya se confirmó que la cabecera
-// está puesta, para no consultar A1 en cada corrida del cron una vez que
-// ya se sabe que está bien.
-let headerConfirmed = false;
+// Cabecera de la hoja "LOG" — una fila por mensaje de diagnóstico (ver
+// worker.js, logToSheet()). Mismo criterio que HEADER_ROW: una sola fuente
+// de verdad para lo que se escribe y lo que dice la cabecera.
+const LOG_HEADER_ROW = ["timestamp", "nivel", "mensaje"];
 
-// Se fija si A1:H1 ya tiene la cabecera puesta; si está vacía (hoja nueva)
-// o tiene otra cosa, escribe HEADER_ROW ahí. Usa `update` (PUT) apuntando
-// directo a la fila 1 — así siempre queda ahí sin desplazar los datos que
-// ya haya debajo, y nunca se duplica con sucesivas corridas del cron.
-async function ensureHeaderRow(env, token, sheetId) {
-  if (headerConfirmed) return;
+// Cachea en memoria del propio Worker, por nombre de hoja, si ya se
+// confirmó que su cabecera está puesta — para no consultar la fila 1 en
+// cada corrida una vez que ya se sabe que está bien. DATOS y LOG se
+// trackean por separado porque son hojas distintas dentro del mismo
+// spreadsheet.
+const headerConfirmedBySheet = { DATOS: false, LOG: false };
 
-  const range = "DATOS!A1:H1";
+// Se fija si la fila 1 de `sheetName` ya tiene la cabecera esperada
+// (`headerRow`); si está vacía (hoja nueva) o tiene otra cosa, la escribe
+// ahí. Usa `update` (PUT) apuntando directo a la fila 1 — así siempre
+// queda ahí sin desplazar los datos que ya haya debajo, y nunca se
+// duplica con sucesivas corridas.
+async function ensureSheetHeader(env, token, sheetId, sheetName, headerRow) {
+  if (headerConfirmedBySheet[sheetName]) return;
+
+  const lastCol = String.fromCharCode("A".charCodeAt(0) + headerRow.length - 1);
+  const range = `${sheetName}!A1:${lastCol}1`;
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}`;
   const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   if (!resp.ok) {
     const text = await resp.text();
-    throw new Error(`Google Sheets lectura de cabecera falló (HTTP ${resp.status}): ${text}`);
+    throw new Error(`Google Sheets lectura de cabecera (${sheetName}) falló (HTTP ${resp.status}): ${text}`);
   }
   const data = await resp.json();
   const currentFirstRow = (data.values && data.values[0]) || [];
-  const yaTieneCabecera = HEADER_ROW.every((h, i) => currentFirstRow[i] === h);
+  const yaTieneCabecera = headerRow.every((h, i) => currentFirstRow[i] === h);
 
   if (yaTieneCabecera) {
-    headerConfirmed = true;
+    headerConfirmedBySheet[sheetName] = true;
     return;
   }
 
@@ -167,13 +176,13 @@ async function ensureHeaderRow(env, token, sheetId) {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ values: [HEADER_ROW] }),
+    body: JSON.stringify({ values: [headerRow] }),
   });
   if (!putResp.ok) {
     const text = await putResp.text();
-    throw new Error(`Google Sheets escritura de cabecera falló (HTTP ${putResp.status}): ${text}`);
+    throw new Error(`Google Sheets escritura de cabecera (${sheetName}) falló (HTTP ${putResp.status}): ${text}`);
   }
-  headerConfirmed = true;
+  headerConfirmedBySheet[sheetName] = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -194,9 +203,9 @@ export async function appendSnapshotRows(env, stations) {
   // (p.ej. problema puntual de permisos), no debe frenar el guardado del
   // snapshot en sí — se deja constancia y se sigue con el append normal.
   try {
-    await ensureHeaderRow(env, token, sheetId);
+    await ensureSheetHeader(env, token, sheetId, "DATOS", HEADER_ROW);
   } catch (e) {
-    console.error("[sheets] No se pudo confirmar/escribir la cabecera:", e.message || e);
+    console.error("[sheets] No se pudo confirmar/escribir la cabecera de DATOS:", e.message || e);
   }
 
   const timestamp = new Date().toISOString();
@@ -235,6 +244,55 @@ export async function appendSnapshotRows(env, stations) {
 }
 
 // ---------------------------------------------------------------------------
+// Escritura de diagnóstico: agrega mensajes a la hoja "LOG", una fila por
+// mensaje — mismo mecanismo que appendSnapshotRows() pero para los
+// mensajes que antes solo iban a console.log/console.error (visibles
+// únicamente en el stream de Logs de Cloudflare mientras alguien lo tiene
+// abierto). Guardarlos en Sheets los deja consultables después, sin tener
+// que estar mirando el stream en vivo en el momento exacto en que ocurren.
+//
+// `entries` es un array de { nivel, mensaje } — se agrupan todos bajo el
+// mismo timestamp de la llamada, igual que appendSnapshotRows agrupa todas
+// las estaciones de una corrida bajo un solo timestamp.
+// ---------------------------------------------------------------------------
+export async function appendLogRows(env, entries) {
+  if (!entries || entries.length === 0) return null;
+
+  const sheetId = env.GOOGLE_SHEET_ID;
+  if (!sheetId) throw new Error("Falta el secret GOOGLE_SHEET_ID.");
+
+  const token = await getAccessToken(env);
+
+  try {
+    await ensureSheetHeader(env, token, sheetId, "LOG", LOG_HEADER_ROW);
+  } catch (e) {
+    console.error("[sheets] No se pudo confirmar/escribir la cabecera de LOG:", e.message || e);
+  }
+
+  const timestamp = new Date().toISOString();
+  const values = entries.map(e => [timestamp, e.nivel || "info", e.mensaje]);
+
+  const range = "LOG!A:C";
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ values }),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Google Sheets append a LOG falló (HTTP ${resp.status}): ${text}`);
+  }
+
+  return resp.json();
+}
+
+// ---------------------------------------------------------------------------
 // Lectura: trae TODAS las filas de la hoja (simple pero funcional para el
 // volumen esperado — ver nota de límites en worker.js). Se usa para
 // encontrar, por cada estación, su snapshot más reciente ANTERIOR a la
@@ -260,7 +318,7 @@ export async function readAllSnapshotRows(env) {
   const data = await resp.json();
   let rows = data.values || [];
   // La fila 1 puede ser la cabecera (["timestamp","codigo",...], ver
-  // ensureHeaderRow) — si está, se descarta acá para que no se procese
+  // ensureSheetHeader) — si está, se descarta acá para que no se procese
   // como si fuera una lectura real (rompería Number() en las columnas
   // numéricas, ya que "valorMedicion" no es un número válido).
   if (rows.length > 0 && rows[0][0] === HEADER_ROW[0] && rows[0][1] === HEADER_ROW[1]) {
