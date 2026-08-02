@@ -234,6 +234,17 @@ async function loadCaudalEstacion(codigo, tipoEstacion) {
   return res.json();
 }
 
+// Histórico de Nivel de Agua de UNA estación — se llama al abrir su ficha
+// de detalle, para graficar la evolución reciente contra el umbral. Igual
+// que el Caudal, requiere Worker configurado (necesita leer Sheets).
+async function loadHistoricoEstacion(codigo) {
+  if (!WORKER_URL) return null;
+  const endpoint = `${WORKER_URL.replace(/\/$/, "")}/historico?codigo=${encodeURIComponent(codigo)}`;
+  const res = await fetch(endpoint, { cache: "no-store" });
+  if (!res.ok) throw new Error(`El Worker respondió con error (HTTP ${res.status}).`);
+  return res.json();
+}
+
 export default function CentroMando() {
   // `data`: resultado de la carga básica inicial (todas las categorías,
   // SIN Caudal) — es lo que alimenta los conteos, el desglose regional y
@@ -697,9 +708,9 @@ function RegionFigure({ count, styleKey }) {
 
 // ---------- Botón grande de categoría ----------
 // Uno de los 3 botones principales de la pantalla ("Revisar alertas
-// Rojas/Amarillas/Azules"). Al pincharlo se pide recién ahí el detalle
-// (con Caudal) de esa categoría — antes de eso solo se sabe el conteo,
-// que viene de la carga básica inicial.
+// Rojas/Amarillas/Azules"). Al pincharlo se pide Nivel de Agua + tendencia
+// de toda la categoría — rápido, sin Caudal (eso se pide aparte, por
+// tarjeta, con el botón "Obtener Caudal" — ver StationCard).
 function CategoryButton({ styleKey, label, count, active, blocked, onClick }) {
   const s = ALERT_STYLES[styleKey];
   const disabled = count === 0 || blocked;
@@ -735,13 +746,13 @@ function CategoryButton({ styleKey, label, count, active, blocked, onClick }) {
       </p>
       {!disabled && (
         <p className="font-mono text-[11px] text-[#7C8F88] mt-3">
-          {active ? "Tocá para cerrar ↑" : "Tocá para ver detalle y Caudal →"}
+          {active ? "Tocá para cerrar ↑" : "Tocá para ver detalle →"}
         </p>
       )}
       {blocked && active && (
         <p className={`font-mono text-[11px] mt-3 flex items-center gap-1.5 ${s.text}`}>
           <RefreshCw className="w-3 h-3 animate-spin" />
-          Consultando Caudal...
+          Consultando Nivel de Agua...
         </p>
       )}
       {blocked && !active && (
@@ -836,6 +847,20 @@ function StationCard({ station, index, onOpen, onObtenerCaudal }) {
   const caudalError = station.caudalEstado?.error;
   const exceso = station.umbral ? Math.round(((station.valorMedicion - station.umbral) / station.umbral) * 100) : null;
 
+  // La ficha de detalle se abre recién cuando ya se intentó pedir el
+  // Caudal de esta estación (con o sin éxito — lo que importa es que la
+  // DGA ya fue consultada, no que haya dato) — así el usuario decide con
+  // intención abrir la consulta puntual antes de ver el detalle completo,
+  // en vez de que abrir cualquier tarjeta dispare la petición. Azul es la
+  // excepción: nunca pide Caudal (ver worker.js), así que su ficha se
+  // abre directo, sin bloqueo.
+  const puedeAbrirse = yaConsultado || station.tipoAlerta === "Azul";
+
+  function handleOpen() {
+    if (!puedeAbrirse) return;
+    onOpen();
+  }
+
   function handleObtenerCaudal(e) {
     e.stopPropagation(); // no abrir la ficha de detalle al pinchar este botón puntual
     onObtenerCaudal(station);
@@ -845,14 +870,17 @@ function StationCard({ station, index, onOpen, onObtenerCaudal }) {
     <div
       role="button"
       tabIndex={0}
-      onClick={onOpen}
-      onKeyDown={e => { if (e.key === "Enter" || e.key === " ") onOpen(); }}
+      aria-disabled={!puedeAbrirse}
+      onClick={handleOpen}
+      onKeyDown={e => { if ((e.key === "Enter" || e.key === " ") && puedeAbrirse) onOpen(); }}
       style={{
         animationDelay: `${Math.min(index, 14) * 35}ms`,
         borderColor: s.pulse ? "rgba(232,73,46,0.7)" : undefined,
       }}
-      className={`rise-in group relative text-left rounded-xl border-2 overflow-hidden flex flex-col transition-transform hover:-translate-y-0.5 cursor-pointer ${
-        s.pulse ? "urgent-pulse" : `${s.borderSoft} ${s.bg} hover:border-opacity-90`
+      className={`rise-in group relative text-left rounded-xl border-2 overflow-hidden flex flex-col transition-transform ${
+        puedeAbrirse ? "hover:-translate-y-0.5 cursor-pointer" : "cursor-default"
+      } ${
+        s.pulse ? "urgent-pulse" : `${s.borderSoft} ${s.bg} ${puedeAbrirse ? "hover:border-opacity-90" : ""}`
       }`}
     >
       {/* Cabecera de severidad */}
@@ -954,7 +982,13 @@ function StationCard({ station, index, onOpen, onObtenerCaudal }) {
           <span title="Hora de generación del mapa de la DGA — no es la hora exacta de medición de este río en particular.">
             DGA: {station.fecha}
           </span>
-          <span className="flex items-center gap-1 font-semibold group-hover:text-[#7ECBDE]">Detalle →</span>
+          {puedeAbrirse ? (
+            <span className="flex items-center gap-1 font-semibold group-hover:text-[#7ECBDE]">Detalle →</span>
+          ) : (
+            <span className="flex items-center gap-1 text-[#5C726A]" title="Obtené el Caudal primero para ver la ficha de detalle">
+              Detalle bloqueado
+            </span>
+          )}
         </div>
       </div>
     </div>
@@ -968,6 +1002,30 @@ function StationDialog({ station, estacionesCategoria, onClose, onOpenStation, o
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+
+  // Histórico de Nivel de Agua para el gráfico — se pide cada vez que
+  // cambia la estación mostrada (abrir una ficha nueva, o saltar a la
+  // sugerencia cercana desde acá mismo). Vive en este componente, no en
+  // CentroMando, porque solo el diálogo lo necesita — no tiene sentido
+  // acarrearlo por toda la cadena de props como el Caudal.
+  const [historico, setHistorico] = useState(null);
+  const [historicoLoading, setHistoricoLoading] = useState(false);
+  const [historicoError, setHistoricoError] = useState(null);
+
+  useEffect(() => {
+    let cancelado = false;
+    setHistorico(null);
+    setHistoricoError(null);
+    setHistoricoLoading(true);
+    loadHistoricoEstacion(station.codigo)
+      .then(json => { if (!cancelado) setHistorico(json); })
+      .catch(e => { if (!cancelado) setHistoricoError(e.message || "Error desconocido"); })
+      .finally(() => { if (!cancelado) setHistoricoLoading(false); });
+    // `cancelado` evita pisar el estado con la respuesta de una estación
+    // vieja si el usuario salta a otra ficha (ej. sugerencia cercana)
+    // antes de que la petición anterior termine.
+    return () => { cancelado = true; };
+  }, [station.codigo]);
 
   const s = ALERT_STYLES[station.tipoAlerta] || ALERT_STYLES.Azul;
   const d = station.detalle;
@@ -1050,6 +1108,23 @@ function StationDialog({ station, estacionesCategoria, onClose, onOpenStation, o
               </div>
             </div>
             {station.tendencia && <TendenciaTag tendencia={station.tendencia} />}
+          </div>
+
+          {/* Evolución del Nivel de Agua — gráfico de línea contra el
+              umbral de alerta, usando el histórico guardado en Sheets por
+              el cron (una lectura cada 30 min). Vive acá, justo debajo de
+              la medición principal, porque es la misma magnitud graficada
+              en el tiempo. */}
+          <div className="mb-4">
+            <p className="text-[11px] text-[#7C8F88] uppercase tracking-wide mb-1.5">Evolución reciente</p>
+            <HistoricoChart
+              puntos={historico?.puntos}
+              loading={historicoLoading}
+              error={historicoError}
+              umbral={station.umbral}
+              unidad={station.unidad}
+              colorClass={s.text}
+            />
           </div>
 
           {/* Ubicación exacta de la estación */}
@@ -1159,6 +1234,117 @@ function StationDialog({ station, estacionesCategoria, onClose, onOpenStation, o
             Fuente: Dirección General de Aguas (DGA) — Sistema Nacional de Información del Agua (SNIA). Dato de estación física real, no modelo. La hora "Mapa DGA" es cuándo la DGA generó su mapa (igual para todas las estaciones), no la hora exacta de esta medición — la DGA no publica esa hora por estación.
           </p>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Gráfico de histórico (Nivel de Agua vs. tiempo) ----------
+// SVG hecho a mano (sin librería de gráficos: es solo una línea de tiempo
+// con una recta de umbral, no justifica una dependencia nueva). Recibe
+// `puntos` tal como los devuelve /historico: [{ timestamp, valorMedicion,
+// umbral, ... }, ...] ordenados cronológicamente ascendente.
+function HistoricoChart({ puntos, loading, error, umbral, unidad, colorClass }) {
+  if (loading) {
+    return (
+      <div className="rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-8 flex items-center justify-center gap-2">
+        <RefreshCw className="w-3.5 h-3.5 text-[#7ECBDE] animate-spin" />
+        <p className="font-mono text-[12px] text-[#9BAEA8]">Cargando histórico...</p>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-3">
+        <p className="text-[12px] text-[#9BAEA8]">No se pudo cargar el histórico: {error}</p>
+      </div>
+    );
+  }
+
+  // Menos de 2 puntos no alcanza para trazar una línea con sentido — pasa
+  // seguido con estaciones que recién empezaron a aparecer en alerta (el
+  // cron todavía no acumuló varias corridas para ellas).
+  const validos = (puntos || []).filter(p => p.valorMedicion != null);
+  if (validos.length < 2) {
+    return (
+      <div className="rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 py-3">
+        <p className="text-[12px] text-[#9BAEA8] leading-relaxed">
+          Todavía no hay suficiente histórico guardado para graficar esta estación — el cron guarda una lectura cada 30 min, volvé a revisar más tarde.
+        </p>
+      </div>
+    );
+  }
+
+  // Layout del SVG: viewBox fijo, se escala solo con el contenedor.
+  const W = 600, H = 180, padL = 44, padR = 12, padT = 14, padB = 24;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+
+  const valores = validos.map(p => p.valorMedicion);
+  const umbralRef = umbral ?? validos[0].umbral;
+  const minVal = Math.min(...valores, umbralRef ?? Infinity);
+  const maxVal = Math.max(...valores, umbralRef ?? -Infinity);
+  // Margen del 8% arriba/abajo para que la línea no quede pegada a los bordes.
+  const rango = Math.max(maxVal - minVal, 0.01);
+  const margen = rango * 0.08;
+  const yMin = minVal - margen;
+  const yMax = maxVal + margen;
+
+  const times = validos.map(p => new Date(p.timestamp).getTime());
+  const tMin = Math.min(...times);
+  const tMax = Math.max(...times);
+  const tRango = Math.max(tMax - tMin, 1);
+
+  function x(i) { return padL + (plotW * (times[i] - tMin)) / tRango; }
+  function y(v) { return padT + plotH - (plotH * (v - yMin)) / (yMax - yMin); }
+
+  const linePath = validos.map((p, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(p.valorMedicion).toFixed(1)}`).join(" ");
+  const areaPath = `${linePath} L${x(validos.length - 1).toFixed(1)},${(padT + plotH).toFixed(1)} L${x(0).toFixed(1)},${(padT + plotH).toFixed(1)} Z`;
+
+  const yUmbral = umbralRef != null ? y(umbralRef) : null;
+
+  // Etiquetas de tiempo: primera y última lectura, en hora local corta.
+  const fmtHora = ts => new Date(ts).toLocaleString("es-CL", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+
+  return (
+    <div className="rounded-lg bg-[#0A1210] border border-[#1E332C] px-4 pt-4 pb-3">
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" preserveAspectRatio="none" style={{ height: 180 }}>
+        {/* Grilla horizontal simple: min / medio / max del eje Y */}
+        {[yMin, (yMin + yMax) / 2, yMax].map((v, i) => (
+          <g key={i}>
+            <line x1={padL} x2={W - padR} y1={y(v)} y2={y(v)} stroke="#1E332C" strokeWidth="1" />
+            <text x={padL - 6} y={y(v) + 3} textAnchor="end" fontSize="9" fill="#7C8F88" fontFamily="IBM Plex Mono, monospace">
+              {v.toFixed(1)}
+            </text>
+          </g>
+        ))}
+
+        {/* Línea de umbral — punteada, para distinguirla claramente de la medición real */}
+        {yUmbral != null && (
+          <>
+            <line x1={padL} x2={W - padR} y1={yUmbral} y2={yUmbral} stroke="#E8A33D" strokeWidth="1.5" strokeDasharray="4 3" opacity="0.8" />
+            <text x={W - padR} y={yUmbral - 4} textAnchor="end" fontSize="9" fill="#E8A33D" fontFamily="IBM Plex Mono, monospace">
+              umbral {umbralRef}
+            </text>
+          </>
+        )}
+
+        {/* Área bajo la curva, sutil */}
+        <path d={areaPath} fill="currentColor" className={colorClass} opacity="0.08" />
+
+        {/* Línea de la serie */}
+        <path d={linePath} fill="none" stroke="currentColor" strokeWidth="2" className={colorClass} strokeLinejoin="round" strokeLinecap="round" />
+
+        {/* Puntos */}
+        {validos.map((p, i) => (
+          <circle key={i} cx={x(i)} cy={y(p.valorMedicion)} r="2.5" fill="currentColor" className={colorClass} />
+        ))}
+      </svg>
+      <div className="flex items-center justify-between mt-1 font-mono text-[10px] text-[#7C8F88]">
+        <span>{fmtHora(validos[0].timestamp)}</span>
+        <span>{unidad}</span>
+        <span>{fmtHora(validos[validos.length - 1].timestamp)}</span>
       </div>
     </div>
   );

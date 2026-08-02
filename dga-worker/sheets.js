@@ -410,3 +410,13 @@ export function findLatestPreviousByCode(allRows, codigos) {
   }
   return result;
 }
+
+// Histórico completo de UNA estación (todas sus filas dentro del tramo que
+// trajo readAllSnapshotRows), ordenado cronológicamente ascendente — listo
+// para graficar Nivel de Agua vs. tiempo. Se usa en el diálogo de detalle
+// para mostrar la evolución reciente contra el umbral de alerta.
+export function historicoPorCodigo(allRows, codigo) {
+  return allRows
+    .filter(r => r.codigo === codigo)
+    .sort((a, b) => (a.timestamp || "").localeCompare(b.timestamp || ""));
+}

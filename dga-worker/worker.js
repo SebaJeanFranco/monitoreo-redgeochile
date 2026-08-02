@@ -45,7 +45,7 @@
  * Sheets ni de credenciales.
  */
 
-import { appendSnapshotRows, appendLogRows, readAllSnapshotRows, findLatestPreviousByCode } from "./sheets.js";
+import { appendSnapshotRows, appendLogRows, readAllSnapshotRows, findLatestPreviousByCode, historicoPorCodigo } from "./sheets.js";
 
 const SNIA_URL = "https://snia.mop.gob.cl/sat/site/informes/mapas/mapas.xhtml";
 
@@ -587,6 +587,25 @@ async function handleCaudalEstacion(url, env) {
   return { codigo, detalle };
 }
 
+// -----------------------------------------------------------------------
+// Histórico de Nivel de Agua de UNA estación — endpoint /historico. Lee la
+// hoja "DATOS" (mismo mecanismo que la tendencia, ver readAllSnapshotRows)
+// y devuelve todas las filas de esa estación dentro del tramo disponible,
+// ordenadas por tiempo — pensado para graficar la evolución del Nivel de
+// Agua contra su umbral de alerta en el diálogo de detalle. No incluye
+// Caudal: la hoja "DATOS" nunca guardó esa columna (ver appendSnapshotRows
+// en sheets.js), así que este histórico es solo de Nivel de Agua/umbral.
+// -----------------------------------------------------------------------
+async function handleHistoricoEstacion(url, env) {
+  const codigo = url.searchParams.get("codigo");
+  if (!codigo) {
+    throw new Error("Falta el parámetro codigo.");
+  }
+  const allRows = await readAllSnapshotRows(env);
+  const puntos = historicoPorCodigo(allRows, codigo);
+  return { codigo, puntos };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -609,6 +628,7 @@ export default {
           "/alertas?detalle=1&color=Azul",
           "/alertas?all=1",
           "/caudal?codigo=XXXXXXX-X&tipoEstacion=Fluviometricas",
+          "/historico?codigo=XXXXXXX-X",
         ],
       });
     }
@@ -625,6 +645,15 @@ export default {
     if (url.pathname === "/caudal") {
       try {
         const data = await handleCaudalEstacion(url, env);
+        return jsonResponse(data);
+      } catch (e) {
+        return jsonResponse({ error: e.message || "Error desconocido" }, 502);
+      }
+    }
+
+    if (url.pathname === "/historico") {
+      try {
+        const data = await handleHistoricoEstacion(url, env);
         return jsonResponse(data);
       } catch (e) {
         return jsonResponse({ error: e.message || "Error desconocido" }, 502);
