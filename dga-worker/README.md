@@ -132,6 +132,43 @@ wrangler secret put GOOGLE_SHEET_ID
 ```
 Pegá el ID de la Sheet que copiaste en el paso 3.
 
+**4b. Informe automático a Google Drive (opcional)**
+
+Si además querés que cada corrida del cron genere un informe `.docx` y lo
+suba a Drive:
+
+- **No hace falta crear ni compartir ninguna carpeta a mano.** Las
+  Service Accounts no tienen cuota de almacenamiento propia para crear
+  archivos en una carpeta ajena (aunque tenga permiso de Editor) — la
+  única forma de que funcione sin Google Workspace es que la propia
+  Service Account cree SU carpeta, donde sí tiene cuota, y te la comparta
+  a vos automáticamente la primera vez que corre (ver drive.js si querés
+  el detalle completo). La carpeta se llama **"Informes DGA — Alertas de
+  Ríos"** y aparece en Drive, en la sección **"Compartido conmigo"** (podés
+  agregarla a "Mi unidad" con un clic para que se vea junto al resto).
+
+```powershell
+wrangler secret put GOOGLE_DRIVE_SHARE_WITH_EMAIL
+```
+Pegá tu email personal de Google — a esa dirección se comparte la carpeta
+con permiso de Editor, la primera vez que corre el cron.
+
+```powershell
+wrangler secret put WORKER_SELF_URL
+```
+Pegá la URL pública de este mismo Worker una vez desplegado (paso 5), algo
+como `https://alertas-rios-dga.TU-SUBDOMINIO.workers.dev` — el Worker la
+necesita para pedirse Caudal a sí mismo, estación por estación, sin
+acumular todas esas peticiones contra el límite de subrequests de una sola
+corrida del cron (ver el comentario largo en `worker.js`,
+`generarYSubirInformeAutomatico()`, si querés el detalle completo).
+
+Si no configurás `GOOGLE_DRIVE_SHARE_WITH_EMAIL`/`WORKER_SELF_URL`, el
+resto del Worker sigue funcionando normal — el cron simplemente deja
+constancia en los logs de que no pudo generar el informe automático (o que
+creó la carpeta pero no pudo compartirla con nadie), sin afectar el
+guardado de Nivel de Agua en Sheets ni ninguna otra parte del dashboard.
+
 **5. Desplegar**
 ```powershell
 wrangler deploy
