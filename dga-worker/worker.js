@@ -43,9 +43,25 @@
  * comparación contra su lectura anterior — así el usuario puede ver
  * "subió 8% en 30 min" sin que el navegador tenga que saber nada de
  * Sheets ni de credenciales.
+ *
+ * Informe automático a Drive: la misma corrida del cron, después de
+ * guardar el snapshot, arma el informe de texto (igual formato que el
+ * botón manual "Generar informe" del dashboard — ver informe.js), lo
+ * convierte a .docx (ver docxmaker.js/zipmaker.js, generado a mano sin
+ * dependencias porque Workers no soporta librerías de Node como `docx`) y
+ * lo sube a una carpeta de Google Drive (ver drive.js). Requiere estos
+ * secrets además de los ya usados por Sheets:
+ *   wrangler secret put GOOGLE_DRIVE_FOLDER_ID   (ID de la carpeta de Drive)
+ *   wrangler secret put WORKER_SELF_URL          (URL pública de este Worker,
+ *                                                  ej. https://alertas-rios-dga.TU-SUBDOMINIO.workers.dev)
+ * La carpeta de Drive debe estar compartida con el email de la Service
+ * Account (GOOGLE_CLIENT_EMAIL) con permiso de Editor.
  */
 
 import { appendSnapshotRows, appendLogRows, readAllSnapshotRows, findLatestPreviousByCode, historicoPorCodigo, resumenPorCorrida, resumenPorRegionYCorrida } from "./sheets.js";
+import { subirArchivoADrive } from "./drive.js";
+import { generarInformeTexto } from "./informe.js";
+import { generarDocx } from "./docxmaker.js";
 
 const SNIA_URL = "https://snia.mop.gob.cl/sat/site/informes/mapas/mapas.xhtml";
 
@@ -650,6 +666,106 @@ async function handleResumenNacional(env) {
   return { corridas, corridasPorRegion };
 }
 
+// -----------------------------------------------------------------------
+// Informe automático — se llama desde scheduled() (el cron) al final de
+// cada corrida. Arma el mismo texto que el botón "Generar informe" manual
+// del dashboard (ver informe.js, réplica de generarInformeTexto() en
+// CentroMando.jsx), lo convierte a .docx y lo sube a la carpeta de Drive
+// configurada.
+//
+// Sobre el límite de 50 subrequests por invocación (plan Free de
+// Cloudflare Workers): pedir Caudal de N estaciones LLAMANDO A LA FUNCIÓN
+// INTERNA directo (fetchDetalleEnLotes) acumularía ~2 subrequests por
+// estación DENTRO de esta misma invocación del cron — con más de ~20
+// estaciones en alerta, se supera el límite y el cron entero falla.
+//
+// La solución: en vez de llamar la función interna, esta corrida le pide
+// el Caudal a SU PROPIA URL pública (env.WORKER_SELF_URL + "/caudal"),
+// una estación a la vez. Cada uno de esos fetch() es 1 solo subrequest
+// para ESTA invocación (la petición GET/POST real a la DGA ocurre "adentro"
+// de la invocación NUEVA que Cloudflare crea para atender esa llamada a
+// /caudal — con su propio presupuesto de 50, fresco). Es exactamente el
+// mismo patrón que ya usa sin saberlo el botón manual del dashboard: cada
+// clic en "Obtener Caudal" es una petición HTTP nueva e independiente.
+// -----------------------------------------------------------------------
+async function generarYSubirInformeAutomatico(env, todasLasEstaciones) {
+  const selfUrl = env.WORKER_SELF_URL;
+  if (!selfUrl) {
+    console.error("[informe] Falta el secret/var WORKER_SELF_URL — no se puede pedir Caudal a sí mismo.");
+    return;
+  }
+
+  // Solo Roja y Amarilla entran al informe — mismo criterio que el botón
+  // manual (Azul nunca pide Caudal ni aparece en el informe).
+  const elegibles = todasLasEstaciones.filter(s => s.tipoAlerta === "Roja" || s.tipoAlerta === "Amarilla");
+  if (elegibles.length === 0) {
+    console.log("[informe] Sin estaciones Roja/Amarilla esta corrida — no se genera informe.");
+    return;
+  }
+
+  // Caudal, en serie — una llamada HTTP a sí mismo por estación. Sin
+  // límite de cantidad (a diferencia del botón manual, que topa en
+  // MAX_DETALLE_STATIONS para no hacer esperar a un humano): acá no hay
+  // nadie esperando, y el límite real (15 min de wall time del cron) da
+  // margen de sobra incluso con 100+ estaciones.
+  for (const s of elegibles) {
+    try {
+      const caudalUrl = `${selfUrl.replace(/\/$/, "")}/caudal?codigo=${encodeURIComponent(s.codigo)}&tipoEstacion=${encodeURIComponent(s.tipoEstacion || "")}`;
+      const resp = await fetch(caudalUrl);
+      if (resp.ok) {
+        const json = await resp.json();
+        if (json?.detalle) s.detalle = json.detalle;
+      }
+    } catch (e) {
+      // Una estación que falla no debe frenar el resto del informe —
+      // igual criterio que en el botón manual del dashboard.
+      console.error(`[informe] Error pidiendo Caudal de ${s.codigo}:`, e.message || e);
+    }
+    await sleep(DETALLE_DELAY_MS);
+  }
+
+  // Tendencia contra el histórico de Sheets — mismo cálculo que usa el
+  // resto del dashboard (calcularTendencia), comparando contra la última
+  // corrida guardada ANTES de esta (findLatestPreviousByCode ya descarta
+  // la fila que se acaba de guardar en esta misma corrida, ver sheets.js).
+  try {
+    const allRows = await readAllSnapshotRows(env);
+    const codigos = elegibles.map(s => s.codigo);
+    const previos = findLatestPreviousByCode(allRows, codigos);
+    for (const s of elegibles) {
+      const previo = previos.get(s.codigo);
+      s.tendencia = calcularTendencia(s, previo);
+    }
+  } catch (e) {
+    console.error("[informe] Error calculando tendencia:", e.message || e);
+  }
+
+  const generadoEn = new Date().toISOString();
+  const texto = generarInformeTexto(elegibles, generadoEn);
+  const lineas = texto.split("\n");
+  const docxBytes = await generarDocx(lineas);
+
+  // Nombre único: correlativo por fecha+hora (ej.
+  // "Informe_2026-08-02_1730.docx") — suficiente para no colisionar entre
+  // corridas de 30 min, y ordena alfabéticamente igual que cronológicamente
+  // dentro de Drive.
+  const fechaChile = new Date().toLocaleString("sv-SE", { timeZone: "America/Santiago" }); // "YYYY-MM-DD HH:mm:ss"
+  const [fechaParte, horaParte] = fechaChile.split(" ");
+  const horaCorta = horaParte.replace(/:/g, "").slice(0, 4); // "HHMM"
+  const nombreArchivo = `Informe_${fechaParte}_${horaCorta}.docx`;
+
+  try {
+    const resultado = await subirArchivoADrive(env, {
+      nombre: nombreArchivo,
+      bytes: docxBytes,
+      mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+    console.log(`[informe] Subido a Drive: ${nombreArchivo} (id: ${resultado.id})`);
+  } catch (e) {
+    console.error("[informe] Error subiendo a Drive:", e.message || e);
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -718,11 +834,15 @@ export default {
   },
 
   // Se invoca automáticamente por el Cron Trigger (ver wrangler.toml),
-  // cada 30 minutos, SIN que ningún usuario visite la web. Guarda un
-  // snapshot de Nivel de Agua de todas las estaciones en alerta en Google
-  // Sheets — es el histórico contra el que se calcula la tendencia cuando
-  // alguien abre una categoría en el dashboard.
+  // cada 30 minutos, SIN que ningún usuario visite la web. Hace dos cosas
+  // independientes entre sí (una NO debe romper la otra si falla):
+  //   1. Guarda un snapshot de Nivel de Agua de todas las estaciones en
+  //      alerta en Google Sheets — el histórico contra el que se calcula
+  //      la tendencia cuando alguien abre una categoría en el dashboard.
+  //   2. Genera el informe de texto (con Caudal) y lo sube como .docx a
+  //      Google Drive — ver generarYSubirInformeAutomatico() más abajo.
   async scheduled(controller, env, ctx) {
+    let stations = null;
     try {
       const pageResp = await fetch(SNIA_URL, { headers: BROWSER_HEADERS });
       if (!pageResp.ok) {
@@ -731,8 +851,9 @@ export default {
       }
       const html = await pageResp.text();
       const rawStations = extractStations(html);
-      const stations = dedupeStations(rawStations.map(normalizeStation));
-      const enAlerta = stations.filter(s => s.alerta);
+      const allStations = dedupeStations(rawStations.map(normalizeStation));
+      const enAlerta = allStations.filter(s => s.alerta);
+      stations = enAlerta;
 
       if (enAlerta.length === 0) {
         console.log("[scheduled] Ninguna estación en alerta — no se escribe nada.");
@@ -747,6 +868,19 @@ export default {
       // se sigue. Un fallo puntual del cron no debe romper nada del resto
       // del sistema: la próxima corrida en 30 min lo intenta de nuevo.
       console.error("[scheduled] Error guardando snapshot:", e.message || e);
+    }
+
+    // Informe automático — completamente aparte del guardado de arriba.
+    // Si esto falla (Drive caído, Caudal no disponible, etc.), el
+    // guardado de Nivel de Agua en Sheets YA se hizo y no se pierde por
+    // este error — son dos responsabilidades independientes de la misma
+    // corrida del cron.
+    if (stations && stations.length > 0) {
+      try {
+        await generarYSubirInformeAutomatico(env, stations);
+      } catch (e) {
+        console.error("[scheduled] Error generando/subiendo el informe automático:", e.message || e);
+      }
     }
   },
 };

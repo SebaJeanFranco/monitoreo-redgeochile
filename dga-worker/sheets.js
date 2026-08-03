@@ -18,7 +18,16 @@
  */
 
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
+// Un solo scope combinado alcanza para ambas APIs (Sheets + Drive) con el
+// mismo token — no hace falta pedir tokens separados por servicio. El
+// scope de Drive es "drive.file", el más acotado posible: solo permite
+// crear/editar archivos que la propia Service Account creó (o que se le
+// compartieron explícitamente), no un acceso general a todo el Drive del
+// usuario — coherente con que la Service Account solo necesita escribir
+// en la carpeta puntual que se le compartió para los informes.
 const SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets";
+const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+const COMBINED_SCOPE = `${SHEETS_SCOPE} ${DRIVE_SCOPE}`;
 
 function base64UrlEncode(bytes) {
   let binary = "";
@@ -72,7 +81,7 @@ async function importPrivateKey(pem) {
 let cachedToken = null;
 let cachedTokenExpiry = 0;
 
-async function getAccessToken(env) {
+export async function getAccessToken(env) {
   const now = Math.floor(Date.now() / 1000);
   if (cachedToken && now < cachedTokenExpiry - 60) return cachedToken;
 
@@ -85,7 +94,7 @@ async function getAccessToken(env) {
   const header = { alg: "RS256", typ: "JWT" };
   const claimSet = {
     iss: clientEmail,
-    scope: SHEETS_SCOPE,
+    scope: COMBINED_SCOPE,
     aud: TOKEN_URL,
     iat: now,
     exp: now + 3600,
