@@ -132,26 +132,34 @@ wrangler secret put GOOGLE_SHEET_ID
 ```
 Pegá el ID de la Sheet que copiaste en el paso 3.
 
-**4b. Informe automático a Google Drive (opcional)**
+**4b. Informe automático a un Google Doc (opcional)**
 
-Si además querés que cada corrida del cron genere un informe `.docx` y lo
-suba a Drive:
+Si además querés que cada corrida del cron actualice un informe con las
+estaciones en alerta Roja/Amarilla (con Caudal), coloreado por severidad:
 
-- **No hace falta crear ni compartir ninguna carpeta a mano.** Las
-  Service Accounts no tienen cuota de almacenamiento propia para crear
-  archivos en una carpeta ajena (aunque tenga permiso de Editor) — la
-  única forma de que funcione sin Google Workspace es que la propia
-  Service Account cree SU carpeta, donde sí tiene cuota, y te la comparta
-  a vos automáticamente la primera vez que corre (ver drive.js si querés
-  el detalle completo). La carpeta se llama **"Informes DGA — Alertas de
-  Ríos"** y aparece en Drive, en la sección **"Compartido conmigo"** (podés
-  agregarla a "Mi unidad" con un clic para que se vea junto al resto).
+- Creá un Google Doc nuevo (podés ponerle cualquier nombre, ej.
+  "Informe de Alertas — Ríos DGA").
+- **Compartilo** con el `client_email` de la Service Account (el mismo
+  del paso 3), con permiso de **Editor**.
+- Copiá el ID del documento de su URL: en
+  `https://docs.google.com/document/d/ESTE_ES_EL_ID/edit`, es la parte
+  entre `/d/` y `/edit`.
+
+> **Por qué un Doc fijo que se reescribe, en vez de un archivo nuevo por
+> corrida:** se probó primero subir un `.docx` nuevo a Drive en cada
+> corrida, pero las Service Accounts de Google no tienen cuota de
+> almacenamiento propia desde junio de 2023 — no pueden crear archivos
+> nuevos en Drive bajo ningún esquema disponible con una cuenta Gmail
+> personal (ni con una carpeta ajena, ni con una carpeta propia). *Editar*
+> el contenido de un documento que ya existe y pertenece a tu cuenta sí
+> funciona, mismo principio por el que el guardado en Sheets ya
+> funcionaba — por eso el diseño final reescribe un Doc fijo en vez de
+> crear archivos nuevos.
 
 ```powershell
-wrangler secret put GOOGLE_DRIVE_SHARE_WITH_EMAIL
+wrangler secret put GOOGLE_DOC_ID
 ```
-Pegá tu email personal de Google — a esa dirección se comparte la carpeta
-con permiso de Editor, la primera vez que corre el cron.
+Pegá el ID del documento.
 
 ```powershell
 wrangler secret put WORKER_SELF_URL
@@ -163,10 +171,9 @@ acumular todas esas peticiones contra el límite de subrequests de una sola
 corrida del cron (ver el comentario largo en `worker.js`,
 `generarYSubirInformeAutomatico()`, si querés el detalle completo).
 
-Si no configurás `GOOGLE_DRIVE_SHARE_WITH_EMAIL`/`WORKER_SELF_URL`, el
-resto del Worker sigue funcionando normal — el cron simplemente deja
-constancia en los logs de que no pudo generar el informe automático (o que
-creó la carpeta pero no pudo compartirla con nadie), sin afectar el
+Si no configurás `GOOGLE_DOC_ID`/`WORKER_SELF_URL`, el resto del Worker
+sigue funcionando normal — el cron simplemente deja constancia en los
+logs de que no pudo generar el informe automático, sin afectar el
 guardado de Nivel de Agua en Sheets ni ninguna otra parte del dashboard.
 
 **5. Desplegar**

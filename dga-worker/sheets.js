@@ -27,7 +27,8 @@ const TOKEN_URL = "https://oauth2.googleapis.com/token";
 // en la carpeta puntual que se le compartió para los informes.
 const SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
-const COMBINED_SCOPE = `${SHEETS_SCOPE} ${DRIVE_SCOPE}`;
+const DOCS_SCOPE = "https://www.googleapis.com/auth/documents";
+const COMBINED_SCOPE = `${SHEETS_SCOPE} ${DRIVE_SCOPE} ${DOCS_SCOPE}`;
 
 function base64UrlEncode(bytes) {
   let binary = "";

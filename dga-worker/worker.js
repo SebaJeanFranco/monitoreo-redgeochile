@@ -44,24 +44,28 @@
  * "subió 8% en 30 min" sin que el navegador tenga que saber nada de
  * Sheets ni de credenciales.
  *
- * Informe automático a Drive: la misma corrida del cron, después de
+ * Informe automático a Google Doc: la misma corrida del cron, después de
  * guardar el snapshot, arma el informe de texto (igual formato que el
- * botón manual "Generar informe" del dashboard — ver informe.js), lo
- * convierte a .docx (ver docxmaker.js/zipmaker.js, generado a mano sin
- * dependencias porque Workers no soporta librerías de Node como `docx`) y
- * lo sube a una carpeta de Google Drive (ver drive.js). Requiere estos
- * secrets además de los ya usados por Sheets:
- *   wrangler secret put GOOGLE_DRIVE_FOLDER_ID   (ID de la carpeta de Drive)
+ * botón manual "Generar informe" del dashboard — ver informe.js) y
+ * REEMPLAZA el contenido completo de un Google Doc fijo (ver docs.js),
+ * coloreado por severidad. Se eligió editar un documento fijo en vez de
+ * crear un archivo nuevo cada vez (a Drive, o mandarlo por correo)
+ * porque las Service Accounts de Google no tienen cuota de
+ * almacenamiento propia desde junio 2023 — no pueden crear archivos
+ * nuevos en Drive bajo ningún esquema disponible con una cuenta Gmail
+ * personal. Editar contenido de un Doc que ya existe no tiene ese
+ * problema (mismo principio por el que ya funciona el guardado en
+ * Sheets). Requiere estos secrets además de los ya usados por Sheets:
+ *   wrangler secret put GOOGLE_DOC_ID            (ID del Google Doc,
+ *                                                  compartido con la
+ *                                                  Service Account como Editor)
  *   wrangler secret put WORKER_SELF_URL          (URL pública de este Worker,
  *                                                  ej. https://alertas-rios-dga.TU-SUBDOMINIO.workers.dev)
- * La carpeta de Drive debe estar compartida con el email de la Service
- * Account (GOOGLE_CLIENT_EMAIL) con permiso de Editor.
  */
 
 import { appendSnapshotRows, appendLogRows, readAllSnapshotRows, findLatestPreviousByCode, historicoPorCodigo, resumenPorCorrida, resumenPorRegionYCorrida } from "./sheets.js";
-import { subirArchivoADrive } from "./drive.js";
+import { escribirInformeEnDoc } from "./docs.js";
 import { generarInformeTexto } from "./informe.js";
-import { generarDocx } from "./docxmaker.js";
 
 const SNIA_URL = "https://snia.mop.gob.cl/sat/site/informes/mapas/mapas.xhtml";
 
@@ -670,8 +674,24 @@ async function handleResumenNacional(env) {
 // Informe automático — se llama desde scheduled() (el cron) al final de
 // cada corrida. Arma el mismo texto que el botón "Generar informe" manual
 // del dashboard (ver informe.js, réplica de generarInformeTexto() en
-// CentroMando.jsx), lo convierte a .docx y lo sube a la carpeta de Drive
-// configurada.
+// CentroMando.jsx) y reemplaza el contenido de un Google Doc fijo con ese
+// texto, coloreado por severidad (ver docs.js).
+//
+// Por qué un Doc fijo y no un archivo nuevo por corrida (a Drive, o por
+// correo): se probó subir un .docx nuevo cada 30 min a una carpeta de
+// Drive, pero las Service Accounts de Google NO tienen cuota de
+// almacenamiento propia desde junio 2023 (ni siquiera en una carpeta que
+// la propia Service Account creó) — la única forma de subir archivos con
+// contenido es vía Unidades Compartidas (exclusivo de Google Workspace) u
+// OAuth delegation (requiere ser admin de un dominio Workspace). Ninguna
+// disponible con una cuenta Gmail personal.
+//
+// La solución que sí funciona: en vez de CREAR un archivo nuevo cada
+// corrida, se EDITA un Google Doc fijo que ya existe (ver docs.js) — el
+// mismo principio por el que ya funciona el guardado en Sheets: editar
+// contenido de un archivo ajeno que ya tiene cuota propia no tiene el
+// problema de "crear algo nuevo sin dónde guardarlo". Cada corrida borra
+// el contenido anterior del Doc y escribe el informe actualizado.
 //
 // Sobre el límite de 50 subrequests por invocación (plan Free de
 // Cloudflare Workers): pedir Caudal de N estaciones LLAMANDO A LA FUNCIÓN
@@ -743,26 +763,12 @@ async function generarYSubirInformeAutomatico(env, todasLasEstaciones) {
   const generadoEn = new Date().toISOString();
   const texto = generarInformeTexto(elegibles, generadoEn);
   const lineas = texto.split("\n");
-  const docxBytes = await generarDocx(lineas);
-
-  // Nombre único: correlativo por fecha+hora (ej.
-  // "Informe_2026-08-02_1730.docx") — suficiente para no colisionar entre
-  // corridas de 30 min, y ordena alfabéticamente igual que cronológicamente
-  // dentro de Drive.
-  const fechaChile = new Date().toLocaleString("sv-SE", { timeZone: "America/Santiago" }); // "YYYY-MM-DD HH:mm:ss"
-  const [fechaParte, horaParte] = fechaChile.split(" ");
-  const horaCorta = horaParte.replace(/:/g, "").slice(0, 4); // "HHMM"
-  const nombreArchivo = `Informe_${fechaParte}_${horaCorta}.docx`;
 
   try {
-    const resultado = await subirArchivoADrive(env, {
-      nombre: nombreArchivo,
-      bytes: docxBytes,
-      mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    });
-    console.log(`[informe] Subido a Drive: ${nombreArchivo} (id: ${resultado.id})`);
+    await escribirInformeEnDoc(env, lineas);
+    console.log(`[informe] Google Doc actualizado con ${elegibles.length} estaciones.`);
   } catch (e) {
-    console.error("[informe] Error subiendo a Drive:", e.message || e);
+    console.error("[informe] Error escribiendo en el Google Doc:", e.message || e);
   }
 }
 
