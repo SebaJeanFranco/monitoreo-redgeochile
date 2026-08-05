@@ -254,18 +254,26 @@ export async function appendSnapshotRows(env, stations) {
 }
 
 // ---------------------------------------------------------------------------
-// Escritura de diagnóstico: agrega mensajes a la hoja "LOG", una fila por
-// mensaje — mismo mecanismo que appendSnapshotRows() pero para los
-// mensajes que antes solo iban a console.log/console.error (visibles
-// únicamente en el stream de Logs de Cloudflare mientras alguien lo tiene
-// abierto). Guardarlos en Sheets los deja consultables después, sin tener
-// que estar mirando el stream en vivo en el momento exacto en que ocurren.
+// Escritura de diagnóstico: agrega mensajes a la hoja indicada (por
+// defecto "LOG"), una fila por mensaje — mismo mecanismo que
+// appendSnapshotRows() pero para los mensajes que antes solo iban a
+// console.log/console.error (visibles únicamente en el stream de Logs de
+// Cloudflare mientras alguien lo tiene abierto). Guardarlos en Sheets los
+// deja consultables después, sin tener que estar mirando el stream en
+// vivo en el momento exacto en que ocurren.
 //
 // `entries` es un array de { nivel, mensaje } — se agrupan todos bajo el
 // mismo timestamp de la llamada, igual que appendSnapshotRows agrupa todas
 // las estaciones de una corrida bajo un solo timestamp.
+//
+// `sheetName` permite reusar la misma función para distintas hojas de
+// log — ej. "LOG" para el diagnóstico de Caudal del botón manual, "LOG
+// INFORME" para el diagnóstico del informe automático del cron (ver
+// generarYSubirInformeAutomatico() en worker.js). Cada hoja se crea sola
+// (con su cabecera) la primera vez que se le escribe algo, igual que ya
+// pasa con "LOG" y "DATOS".
 // ---------------------------------------------------------------------------
-export async function appendLogRows(env, entries) {
+export async function appendLogRows(env, entries, sheetName = "LOG") {
   if (!entries || entries.length === 0) return null;
 
   const sheetId = env.GOOGLE_SHEET_ID;
@@ -274,15 +282,15 @@ export async function appendLogRows(env, entries) {
   const token = await getAccessToken(env);
 
   try {
-    await ensureSheetHeader(env, token, sheetId, "LOG", LOG_HEADER_ROW);
+    await ensureSheetHeader(env, token, sheetId, sheetName, LOG_HEADER_ROW);
   } catch (e) {
-    console.error("[sheets] No se pudo confirmar/escribir la cabecera de LOG:", e.message || e);
+    console.error(`[sheets] No se pudo confirmar/escribir la cabecera de ${sheetName}:`, e.message || e);
   }
 
   const timestamp = new Date().toISOString();
   const values = entries.map(e => [timestamp, e.nivel || "info", e.mensaje]);
 
-  const range = "LOG!A:C";
+  const range = `${sheetName}!A:C`;
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
 
   const resp = await fetch(url, {
@@ -296,7 +304,7 @@ export async function appendLogRows(env, entries) {
 
   if (!resp.ok) {
     const text = await resp.text();
-    throw new Error(`Google Sheets append a LOG falló (HTTP ${resp.status}): ${text}`);
+    throw new Error(`Google Sheets append a ${sheetName} falló (HTTP ${resp.status}): ${text}`);
   }
 
   return resp.json();

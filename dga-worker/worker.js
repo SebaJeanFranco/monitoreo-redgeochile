@@ -709,6 +709,7 @@ async function handleResumenNacional(env) {
 // clic en "Obtener Caudal" es una petición HTTP nueva e independiente.
 // -----------------------------------------------------------------------
 async function generarYSubirInformeAutomatico(env, todasLasEstaciones) {
+  const logger = makeLogCollector();
   const selfUrl = env.WORKER_SELF_URL;
   if (!selfUrl) {
     console.error("[informe] Falta el secret/var WORKER_SELF_URL — no se puede pedir Caudal a sí mismo.");
@@ -728,20 +729,51 @@ async function generarYSubirInformeAutomatico(env, todasLasEstaciones) {
   // MAX_DETALLE_STATIONS para no hacer esperar a un humano): acá no hay
   // nadie esperando, y el límite real (15 min de wall time del cron) da
   // margen de sobra incluso con 100+ estaciones.
+  //
+  // Cada paso queda registrado en `logger` (→ hoja "LOG INFORME") para
+  // poder diagnosticar sin depender de estar mirando el stream de
+  // wrangler dev en el momento exacto: HTTP no-OK, JSON sin campo
+  // `detalle`, `detalle` presente pero sin `caudalM3s` (la DGA no lo
+  // reportó esta vez), excepción de red, o éxito con el valor obtenido.
+  let conCaudal = 0, sinCaudal = 0, errores = 0;
   for (const s of elegibles) {
     try {
       const caudalUrl = `${selfUrl.replace(/\/$/, "")}/caudal?codigo=${encodeURIComponent(s.codigo)}&tipoEstacion=${encodeURIComponent(s.tipoEstacion || "")}`;
       const resp = await fetch(caudalUrl);
-      if (resp.ok) {
+      if (!resp.ok) {
+        errores++;
+        logger.log(`${s.codigo} (${s.nombre}): HTTP ${resp.status} al pedir /caudal — url=${caudalUrl}`);
+      } else {
         const json = await resp.json();
-        if (json?.detalle) s.detalle = json.detalle;
+        if (json?.detalle?.caudalM3s != null) {
+          s.detalle = json.detalle;
+          conCaudal++;
+          logger.log(`${s.codigo} (${s.nombre}): OK, caudal=${json.detalle.caudalM3s} m³/seg`);
+        } else if (json?.detalle) {
+          s.detalle = json.detalle;
+          sinCaudal++;
+          logger.log(`${s.codigo} (${s.nombre}): respuesta OK, detalle presente pero SIN caudalM3s (la DGA no lo reportó) — detalle=${JSON.stringify(json.detalle)}`);
+        } else {
+          sinCaudal++;
+          logger.log(`${s.codigo} (${s.nombre}): respuesta OK pero SIN campo detalle en absoluto — json=${JSON.stringify(json)}`);
+        }
       }
     } catch (e) {
+      errores++;
       // Una estación que falla no debe frenar el resto del informe —
       // igual criterio que en el botón manual del dashboard.
-      console.error(`[informe] Error pidiendo Caudal de ${s.codigo}:`, e.message || e);
+      logger.error(`${s.codigo} (${s.nombre}): excepción pidiendo Caudal — ${e.message || e}`);
     }
     await sleep(DETALLE_DELAY_MS);
+  }
+  logger.log(`Resumen: ${elegibles.length} estaciones · ${conCaudal} con Caudal · ${sinCaudal} sin Caudal · ${errores} con error de red/HTTP.`);
+
+  if (logger.entries.length > 0) {
+    try {
+      await appendLogRows(env, logger.entries, "LOG INFORME");
+    } catch (e) {
+      console.error("[sheets] No se pudo escribir el log del informe automático en LOG INFORME:", e.message || e);
+    }
   }
 
   // Tendencia contra el histórico de Sheets — mismo cálculo que usa el
