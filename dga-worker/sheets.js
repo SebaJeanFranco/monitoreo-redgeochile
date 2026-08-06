@@ -147,6 +147,20 @@ const HEADER_ROW = [
 // de verdad para lo que se escribe y lo que dice la cabecera.
 const LOG_HEADER_ROW = ["timestamp", "nivel", "mensaje"];
 
+// Cabecera de la hoja "DATOS INFORME" — historial en formato tabular del
+// informe automático del cron (ver generarYSubirInformeAutomatico() en
+// worker.js): una fila por ESTACIÓN en cada corrida, con todos los campos
+// que ya aparecen en el texto del informe, pero separados en columnas
+// para poder filtrar/hacer tablas dinámicas después — a diferencia del
+// Google Doc (que muestra el informe "legible" pero de una sola corrida
+// a la vez, se sobreescribe cada 30 min) esta hoja acumula el histórico
+// completo, fila tras fila, sin borrarse nunca.
+const INFORME_HEADER_ROW = [
+  "timestamp", "region", "codigo", "nombre", "tipoAlerta",
+  "nivelAgua", "umbral", "porcentajeSobreUmbral", "unidad",
+  "caudal", "tendenciaDireccion", "tendenciaPorcentaje",
+];
+
 // Cachea en memoria del propio Worker, por nombre de hoja, si ya se
 // confirmó que su cabecera está puesta — para no consultar la fila 1 en
 // cada corrida una vez que ya se sabe que está bien. DATOS y LOG se
@@ -248,6 +262,76 @@ export async function appendSnapshotRows(env, stations) {
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`Google Sheets append falló (HTTP ${resp.status}): ${text}`);
+  }
+
+  return resp.json();
+}
+
+// ---------------------------------------------------------------------------
+// Escritura: agrega el historial tabular del informe automático a la hoja
+// "DATOS INFORME" — una fila por estación de la corrida actual del
+// informe (Roja/Amarilla/Azul, con Caudal y tendencia si se pudieron
+// calcular). A diferencia de "DATOS" (que guarda TODAS las estaciones en
+// alerta cada 30 min, sin Caudal, para el cálculo de tendencia del
+// dashboard), esta hoja guarda específicamente las estaciones que
+// entraron al informe, con Caudal incluido — pensada para análisis y
+// tablas dinámicas en Excel/Sheets, no para el funcionamiento interno del
+// dashboard.
+//
+// `stations` debe venir ya con `s.detalle.caudalM3s` y `s.tendencia`
+// calculados (mismo objeto que usa generarInformeTexto()) — esta función
+// no vuelve a pedir nada, solo transcribe lo que ya se calculó para el
+// texto del informe.
+// ---------------------------------------------------------------------------
+export async function appendInformeHistoricoRows(env, stations, generadoEn) {
+  if (!stations || stations.length === 0) return null;
+
+  const sheetId = env.GOOGLE_SHEET_ID;
+  if (!sheetId) throw new Error("Falta el secret GOOGLE_SHEET_ID.");
+
+  const token = await getAccessToken(env);
+
+  try {
+    await ensureSheetHeader(env, token, sheetId, "DATOS INFORME", INFORME_HEADER_ROW);
+  } catch (e) {
+    console.error("[sheets] No se pudo confirmar/escribir la cabecera de DATOS INFORME:", e.message || e);
+  }
+
+  const timestamp = generadoEn || new Date().toISOString();
+
+  const values = stations.map(s => {
+    const porcentaje = s.umbral ? Math.round(((s.valorMedicion - s.umbral) / s.umbral) * 100) : "";
+    return [
+      timestamp,
+      s.regionNombreAprox,
+      s.codigo,
+      s.nombre,
+      s.tipoAlerta,
+      s.valorMedicion,
+      s.umbral,
+      porcentaje,
+      s.unidad || "m",
+      s.detalle?.caudalM3s ?? "",
+      s.tendencia?.direccion ?? "",
+      s.tendencia?.porcentaje ?? "",
+    ];
+  });
+
+  const range = "DATOS INFORME!A:L";
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ values }),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Google Sheets append a DATOS INFORME falló (HTTP ${resp.status}): ${text}`);
   }
 
   return resp.json();

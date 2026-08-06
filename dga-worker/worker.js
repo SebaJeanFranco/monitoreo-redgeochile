@@ -63,7 +63,7 @@
  *                                                  ej. https://alertas-rios-dga.TU-SUBDOMINIO.workers.dev)
  */
 
-import { appendSnapshotRows, appendLogRows, readAllSnapshotRows, findLatestPreviousByCode, historicoPorCodigo, resumenPorCorrida, resumenPorRegionYCorrida } from "./sheets.js";
+import { appendSnapshotRows, appendLogRows, appendInformeHistoricoRows, readAllSnapshotRows, findLatestPreviousByCode, historicoPorCodigo, resumenPorCorrida, resumenPorRegionYCorrida } from "./sheets.js";
 import { escribirInformeEnDoc } from "./docs.js";
 import { generarInformeTexto } from "./informe.js";
 
@@ -716,11 +716,17 @@ async function generarYSubirInformeAutomatico(env, todasLasEstaciones) {
     return;
   }
 
-  // Solo Roja y Amarilla entran al informe — mismo criterio que el botón
-  // manual (Azul nunca pide Caudal ni aparece en el informe).
-  const elegibles = todasLasEstaciones.filter(s => s.tipoAlerta === "Roja" || s.tipoAlerta === "Amarilla");
+  // Roja, Amarilla y Azul entran al informe automático — a diferencia
+  // del resto del dashboard (tarjetas, botón manual "Obtener Caudal" por
+  // estación), donde Azul nunca pide Caudal para mantener esa carga
+  // rápida cuando hay un humano esperando en pantalla. Acá no hay nadie
+  // esperando (corre solo, cada 30 min), así que se le pide Caudal
+  // también a Azul con el mismo criterio que a Roja/Amarilla.
+  const elegibles = todasLasEstaciones.filter(
+    s => s.tipoAlerta === "Roja" || s.tipoAlerta === "Amarilla" || s.tipoAlerta === "Azul"
+  );
   if (elegibles.length === 0) {
-    console.log("[informe] Sin estaciones Roja/Amarilla esta corrida — no se genera informe.");
+    console.log("[informe] Sin estaciones en alerta esta corrida — no se genera informe.");
     return;
   }
 
@@ -809,6 +815,18 @@ async function generarYSubirInformeAutomatico(env, todasLasEstaciones) {
     console.log(`[informe] Google Doc actualizado con ${elegibles.length} estaciones.`);
   } catch (e) {
     console.error("[informe] Error escribiendo en el Google Doc:", e.message || e);
+  }
+
+  // Historial tabular en paralelo al Doc — hoja "DATOS INFORME", una fila
+  // por estación (no se sobreescribe como el Doc, se va acumulando corrida
+  // tras corrida). Es una responsabilidad independiente de escribir el
+  // Doc: si esto falla, no debe afectar el Doc que ya se actualizó arriba,
+  // y viceversa — por eso tiene su propio try/catch separado.
+  try {
+    await appendInformeHistoricoRows(env, elegibles, generadoEn);
+    console.log(`[informe] DATOS INFORME actualizado con ${elegibles.length} filas.`);
+  } catch (e) {
+    console.error("[informe] Error escribiendo en DATOS INFORME:", e.message || e);
   }
 }
 
