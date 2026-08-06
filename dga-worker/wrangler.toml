@@ -2,6 +2,21 @@ name = "alertas-rios-dga"
 main = "worker.js"
 compatibility_date = "2024-11-01"
 
+# global_fetch_strictly_public: por defecto, un Worker de Cloudflare NO
+# puede hacer fetch() hacia su propia URL pública *.workers.dev (ni hacia
+# otro Worker), y devuelve 404 sin ninguna otra explicación — es un
+# comportamiento documentado de la plataforma, pensado para evitar loops
+# accidentales entre Workers (ver
+# developers.cloudflare.com/workers/runtime-apis/fetch/, sección
+# "Worker-to-Worker fetch requests"). Esta flag lo habilita explícitamente.
+# Es imprescindible para generarYSubirInformeAutomatico() en worker.js: el
+# cron pide Caudal de cada estación llamando a su PROPIO endpoint /caudal
+# vía fetch(), justamente para que cada estación cuente como una
+# invocación nueva e independiente (y no se acumule contra el límite de
+# 50 subrequests por invocación del plan Free) — sin esta flag, todas esas
+# llamadas devuelven 404 y el informe automático nunca trae Caudal.
+compatibility_flags = ["global_fetch_strictly_public"]
+
 # Cron Trigger: corre automáticamente cada 30 minutos, en la nube de
 # Cloudflare, SIN que ningún usuario tenga que visitar la web. Dispara la
 # función `scheduled()` del worker, que guarda un snapshot de Nivel de Agua

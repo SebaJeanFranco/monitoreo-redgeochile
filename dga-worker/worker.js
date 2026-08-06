@@ -739,6 +739,14 @@ async function generarYSubirInformeAutomatico(env, todasLasEstaciones) {
   for (const s of elegibles) {
     try {
       const caudalUrl = `${selfUrl.replace(/\/$/, "")}/caudal?codigo=${encodeURIComponent(s.codigo)}&tipoEstacion=${encodeURIComponent(s.tipoEstacion || "")}`;
+      // IMPORTANTE: por defecto Cloudflare bloquea que un Worker haga
+      // fetch() hacia su propia URL pública *.workers.dev (devuelve 404
+      // sin más explicación) — es la causa real por la que este fetch
+      // fallaba siempre en producción, confirmado con logs reales durante
+      // horas. Se habilita con el compatibility flag
+      // "global_fetch_strictly_public" en wrangler.toml — sin esa flag,
+      // este fetch() SIEMPRE da 404 sin importar que /caudal funcione
+      // perfecto cuando se lo llama desde afuera (navegador, curl, etc.).
       const resp = await fetch(caudalUrl);
       if (!resp.ok) {
         errores++;
