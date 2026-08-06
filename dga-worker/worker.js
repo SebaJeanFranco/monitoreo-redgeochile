@@ -63,7 +63,7 @@
  *                                                  ej. https://alertas-rios-dga.TU-SUBDOMINIO.workers.dev)
  */
 
-import { appendSnapshotRows, appendLogRows, appendInformeHistoricoRows, readAllSnapshotRows, findLatestPreviousByCode, historicoPorCodigo, resumenPorCorrida, resumenPorRegionYCorrida } from "./sheets.js";
+import { appendSnapshotRows, appendLogRows, appendInformeHistoricoRows, readAllSnapshotRows, readInformeHistoricoRows, findLatestPreviousByCode, findLatestPreviousCaudalByCode, historicoPorCodigo, resumenPorCorrida, resumenPorRegionYCorrida } from "./sheets.js";
 import { escribirInformeEnDoc } from "./docs.js";
 import { generarInformeTexto } from "./informe.js";
 
@@ -463,6 +463,36 @@ function calcularTendencia(estacionActual, snapshotPrevio) {
   };
 }
 
+// Variación del Caudal (m³/seg) respecto a un valor anterior — mismo
+// criterio de umbral/redondeo que calcularTendencia() (Nivel de Agua),
+// pero pensada para trabajar sobre valores sueltos (no sobre el objeto
+// completo de una estación) porque el "anterior" acá viene de una fila de
+// "DATOS INFORME" (ver findLatestPreviousCaudalByCode en sheets.js), no
+// de un snapshot de "DATOS" como la de Nivel de Agua.
+function calcularTendenciaCaudal(caudalActual, filaPrevia) {
+  if (caudalActual == null || !filaPrevia || filaPrevia.caudal == null) {
+    return null;
+  }
+  const previo = filaPrevia.caudal;
+  const diferencia = caudalActual - previo;
+  // Umbral relativo (no absoluto como en Nivel de Agua): el Caudal puede
+  // ir de <1 m³/seg a >1000 m³/seg entre estaciones distintas, así que un
+  // umbral fijo en m³/seg no tendría sentido para todas por igual. Se usa
+  // 0.5% del valor previo como corte de "estable", con un piso mínimo
+  // pequeño para evitar división por valores casi cero.
+  const umbralEstable = Math.max(Math.abs(previo) * 0.005, 0.01);
+  const direccion = Math.abs(diferencia) < umbralEstable ? "estable" : diferencia > 0 ? "subiendo" : "bajando";
+  const porcentaje = previo !== 0 ? (diferencia / previo) * 100 : null;
+
+  return {
+    direccion,
+    diferenciaM3s: Math.round(diferencia * 100) / 100,
+    porcentaje: porcentaje != null ? Math.round(porcentaje * 10) / 10 : null,
+    valorAnterior: previo,
+    timestampAnterior: filaPrevia.timestamp,
+  };
+}
+
 async function handleAlertas(url, env) {
   const wantDetalle = url.searchParams.get("detalle") === "1";
   const wantAll = url.searchParams.get("all") === "1";
@@ -804,6 +834,23 @@ async function generarYSubirInformeAutomatico(env, todasLasEstaciones) {
     }
   } catch (e) {
     console.error("[informe] Error calculando tendencia:", e.message || e);
+  }
+
+  // Tendencia de CAUDAL — magnitud distinta a la de arriba (esa es Nivel
+  // de Agua, contra "DATOS"). El Caudal solo tiene histórico en "DATOS
+  // INFORME" (esta misma hoja, se llena solo con las corridas del informe
+  // automático), así que se lee esa hoja aparte y se compara ahí.
+  try {
+    const historicoInforme = await readInformeHistoricoRows(env);
+    const codigos = elegibles.map(s => s.codigo);
+    const previosCaudal = findLatestPreviousCaudalByCode(historicoInforme, codigos);
+    for (const s of elegibles) {
+      const caudalActual = s.detalle?.caudalM3s;
+      const previo = previosCaudal.get(s.codigo);
+      s.tendenciaCaudal = calcularTendenciaCaudal(caudalActual, previo);
+    }
+  } catch (e) {
+    console.error("[informe] Error calculando tendencia de Caudal:", e.message || e);
   }
 
   const generadoEn = new Date().toISOString();

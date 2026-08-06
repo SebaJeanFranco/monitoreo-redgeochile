@@ -155,10 +155,17 @@ const LOG_HEADER_ROW = ["timestamp", "nivel", "mensaje"];
 // Google Doc (que muestra el informe "legible" pero de una sola corrida
 // a la vez, se sobreescribe cada 30 min) esta hoja acumula el histórico
 // completo, fila tras fila, sin borrarse nunca.
+//
+// "tendenciaCaudalDireccion"/"tendenciaCaudalPorcentaje" son la variación
+// del CAUDAL (m³/seg) respecto a la corrida anterior CON Caudal válido de
+// esta misma hoja — no confundir con la tendencia de Nivel de Agua que
+// calcula el resto del dashboard contra "DATOS" (esa es otra magnitud,
+// con su propio histórico en otra hoja). Ver
+// findLatestPreviousCaudalByCode() más abajo.
 const INFORME_HEADER_ROW = [
   "timestamp", "region", "codigo", "nombre", "tipoAlerta",
   "nivelAgua", "umbral", "porcentajeSobreUmbral", "unidad",
-  "caudal", "tendenciaDireccion", "tendenciaPorcentaje",
+  "caudal", "tendenciaCaudalDireccion", "tendenciaCaudalPorcentaje",
 ];
 
 // Cachea en memoria del propio Worker, por nombre de hoja, si ya se
@@ -312,8 +319,8 @@ export async function appendInformeHistoricoRows(env, stations, generadoEn) {
       porcentaje,
       s.unidad || "m",
       s.detalle?.caudalM3s ?? "",
-      s.tendencia?.direccion ?? "",
-      s.tendencia?.porcentaje ?? "",
+      s.tendenciaCaudal?.direccion ?? "",
+      s.tendenciaCaudal?.porcentaje ?? "",
     ];
   });
 
@@ -335,6 +342,92 @@ export async function appendInformeHistoricoRows(env, stations, generadoEn) {
   }
 
   return resp.json();
+}
+
+// ---------------------------------------------------------------------------
+// Lectura: trae las últimas `maxRows` filas de "DATOS INFORME" — mismo
+// criterio que readAllSnapshotRows() para "DATOS" (rango acotado en vez de
+// la hoja entera, para no volver lenta la lectura a medida que la hoja
+// crece con cada corrida). Se usa para calcular la tendencia de Caudal:
+// comparar el valor de esta corrida contra la lectura anterior de la
+// MISMA estación en esta MISMA hoja — a diferencia de la tendencia de
+// Nivel de Agua (que compara contra "DATOS", guardado por el cron
+// principal cada 30 min sin falta), el Caudal solo existe en las corridas
+// donde se generó el informe automático, así que su histórico vive acá.
+// ---------------------------------------------------------------------------
+export async function readInformeHistoricoRows(env, maxRows = 1000) {
+  const sheetId = env.GOOGLE_SHEET_ID;
+  if (!sheetId) throw new Error("Falta el secret GOOGLE_SHEET_ID.");
+
+  const token = await getAccessToken(env);
+
+  const countUrl = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent("DATOS INFORME!A:A")}`;
+  const countResp = await fetch(countUrl, { headers: { Authorization: `Bearer ${token}` } });
+  if (!countResp.ok) {
+    const text = await countResp.text();
+    throw new Error(`Google Sheets read (conteo DATOS INFORME) falló (HTTP ${countResp.status}): ${text}`);
+  }
+  const countData = await countResp.json();
+  const totalRows = (countData.values || []).length;
+
+  // Si la hoja todavía no existe o está vacía (primera corrida del
+  // informe automático), no hay nada que leer — se devuelve vacío en vez
+  // de fallar, para que la primera corrida simplemente no tenga tendencia
+  // de Caudal (no hay nada anterior con qué comparar).
+  if (totalRows < 2) return [];
+
+  const startRow = Math.max(2, totalRows - maxRows + 1);
+  const range = `DATOS INFORME!A${startRow}:L${totalRows}`;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}`;
+
+  const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Google Sheets read (DATOS INFORME) falló (HTTP ${resp.status}): ${text}`);
+  }
+
+  const data = await resp.json();
+  let rows = data.values || [];
+  if (rows.length > 0 && rows[0][0] === INFORME_HEADER_ROW[0] && rows[0][2] === INFORME_HEADER_ROW[2]) {
+    rows = rows.slice(1);
+  }
+  // [timestamp, region, codigo, nombre, tipoAlerta, nivelAgua, umbral,
+  //  porcentajeSobreUmbral, unidad, caudal, tendenciaDireccion, tendenciaPorcentaje]
+  return rows.map(r => ({
+    timestamp: r[0],
+    codigo: r[2],
+    caudal: r[9] != null && r[9] !== "" ? Number(r[9]) : null,
+  }));
+}
+
+// Para cada código pedido, busca en "DATOS INFORME" la corrida MÁS
+// RECIENTE con Caudal válido (no null) ANTERIOR a la actual — mismo
+// principio que findLatestPreviousByCode() para "DATOS", pero sobre el
+// histórico de Caudal en vez de Nivel de Agua. Se salta filas sin Caudal
+// (la DGA no lo reportó esa corrida) para comparar siempre contra un
+// valor real, no contra un hueco.
+export function findLatestPreviousCaudalByCode(allRows, codigos) {
+  const byCode = new Map();
+  for (const row of allRows) {
+    if (!codigos.includes(row.codigo)) continue;
+    if (row.caudal == null) continue; // sin Caudal esa corrida, no sirve de comparación
+    if (!byCode.has(row.codigo)) byCode.set(row.codigo, []);
+    byCode.get(row.codigo).push(row);
+  }
+
+  // Mismo margen de "es la misma corrida actual" que findLatestPreviousByCode
+  // — evita comparar la estación contra sí misma si esta función se llama
+  // DESPUÉS de haber guardado ya la fila de la corrida actual.
+  const MARGEN_MISMA_CORRIDA_MS = 5 * 60 * 1000;
+  const ahora = Date.now();
+
+  const result = new Map();
+  for (const [codigo, rows] of byCode.entries()) {
+    rows.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
+    const previa = rows.find(r => ahora - new Date(r.timestamp).getTime() > MARGEN_MISMA_CORRIDA_MS);
+    if (previa) result.set(codigo, previa);
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
