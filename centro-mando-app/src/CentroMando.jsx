@@ -397,6 +397,18 @@ async function loadHistoricoEstacion(codigo) {
   return res.json();
 }
 
+// Último informe automático — se llama al apretar "Generar informe",
+// ANTES de empezar a pedir Caudal, para ver si ya hay uno reciente
+// escrito por el cron (cada 30 min) y ofrecerle al usuario usarlo tal
+// cual en vez de esperar la consulta completa de nuevo.
+async function loadInformeActual() {
+  if (!WORKER_URL) return null;
+  const endpoint = `${WORKER_URL.replace(/\/$/, "")}/informe-actual`;
+  const res = await fetch(endpoint, { cache: "no-store" });
+  if (!res.ok) throw new Error(`El Worker respondió con error (HTTP ${res.status}).`);
+  return res.json();
+}
+
 // Resumen nacional por corrida del cron (total + desglose por color en las
 // últimas horas) — se pide una vez al cargar el dashboard, junto con la
 // carga básica. Requiere Worker configurado (necesita leer Sheets); sin
@@ -470,7 +482,41 @@ export default function CentroMando() {
   // ya generado.
   const [informeSegDemorado, setInformeSegDemorado] = useState(null);
 
+  // Diálogo de elección: al apretar "Generar informe", antes de arrancar
+  // la consulta completa se revisa si ya hay un informe automático
+  // reciente (escrito por el cron cada 30 min, ver /informe-actual) — si
+  // lo hay, se le pregunta al usuario si prefiere usar ese tal cual (sin
+  // esperar nada) o generar uno nuevo igual.
+  const [eligiendoInforme, setEligiendoInforme] = useState(false);
+  const [informeActualPreview, setInformeActualPreview] = useState(null);
+  const [informeActualError, setInformeActualError] = useState(null);
+
   async function generarInforme() {
+    setEligiendoInforme(true);
+    setInformeActualPreview(null);
+    setInformeActualError(null);
+    try {
+      const json = await loadInformeActual();
+      // Sin fechaHoraTexto reconocible (Doc vacío, o el cron nunca corrió
+      // todavía) no tiene sentido ofrecer "usar el existente" — se salta
+      // directo a generar uno nuevo, como si no hubiera diálogo.
+      if (json?.fechaHoraTexto) {
+        setInformeActualPreview(json);
+      } else {
+        setEligiendoInforme(false);
+        await generarInformeCompleto();
+      }
+    } catch (e) {
+      // Si falla la consulta (Worker caído, GOOGLE_DOC_ID sin configurar,
+      // etc.), no tiene sentido trabar al usuario con un diálogo rígido —
+      // se informa el motivo y se deja igual la opción de generar uno
+      // nuevo desde el propio diálogo.
+      setInformeActualError(e.message || "Error desconocido");
+    }
+  }
+
+  async function generarInformeCompleto() {
+    setEligiendoInforme(false);
     setGenerandoInforme(true);
     setInformeCopiado(false);
     setInformeSegDemorado(null);
@@ -541,6 +587,15 @@ export default function CentroMando() {
       // del cliente — el texto sigue visible en pantalla para seleccionar
       // y copiar a mano como respaldo.
     }
+  }
+
+  // El usuario eligió usar el informe automático ya existente (ver
+  // generarInforme más arriba) — se muestra tal cual, instantáneo, sin
+  // pedir Caudal ni pasar por el overlay de progreso.
+  function usarInformeExistente() {
+    setEligiendoInforme(false);
+    setInformeSegDemorado(0);
+    setInformeTexto(informeActualPreview.texto);
   }
 
   async function refresh() {
@@ -800,7 +855,7 @@ export default function CentroMando() {
             <div className="flex-1 flex justify-end gap-2.5 flex-wrap">
               <button
                 onClick={generarInforme}
-                disabled={loading || sorted.length === 0 || generandoInforme}
+                disabled={loading || sorted.length === 0 || generandoInforme || eligiendoInforme}
                 title="Consulta el Caudal de cada estación Roja/Amarilla en la DGA — puede tardar bastante"
                 className="flex items-center gap-2 px-4 py-2.5 rounded-md border border-[#2A4038] text-[#DCE7E3] hover:text-white hover:border-[#3B8FA3]/60 text-[14px] font-semibold transition-colors disabled:opacity-50"
               >
@@ -1005,6 +1060,19 @@ export default function CentroMando() {
         <TendenciaNacionalDialog
           corridas={resumenNacional?.corridas}
           onClose={() => setTendenciaExpandida(false)}
+        />
+      )}
+
+      {/* Diálogo de elección — se muestra al apretar "Generar informe",
+          ANTES de arrancar la consulta de Caudal, si ya hay un informe
+          automático (escrito por el cron) con fecha/hora reconocible. */}
+      {eligiendoInforme && (
+        <ElegirInformeDialog
+          preview={informeActualPreview}
+          error={informeActualError}
+          onUsarExistente={usarInformeExistente}
+          onGenerarNuevo={generarInformeCompleto}
+          onClose={() => setEligiendoInforme(false)}
         />
       )}
 
@@ -2032,6 +2100,69 @@ function TendenciaNacionalDialog({ corridas, onClose }) {
               <TendenciaSVG enVentana={enVentana} seriesVisibles={seriesVisibles} height={340} maxEtiquetas={8} puntoRadio={3} />
             </>
           )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Diálogo de elección: usar informe existente o generar nuevo ----------
+function ElegirInformeDialog({ preview, error, onUsarExistente, onGenerarNuevo, onClose }) {
+  useEffect(() => {
+    function onKey(e) { if (e.key === "Escape") onClose(); }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm"
+      style={{ zIndex: 10000 }}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Elegir informe"
+      onClick={onClose}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        className="w-full max-w-md rounded-xl border border-[#1E332C] bg-[#0F1B18] shadow-2xl"
+      >
+        <div className="flex items-start justify-between gap-4 px-6 py-5 border-b border-[#1E332C]">
+          <h2 className="font-display font-bold text-xl text-white leading-tight">Ya hay un informe reciente</h2>
+          <button onClick={onClose} className="p-2 rounded-md text-[#9BAEA8] hover:text-[#EDF2F0] hover:bg-[#1E332C] transition-colors flex-shrink-0">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="px-6 py-5">
+          {error && (
+            <p className="text-[13px] text-[#9BAEA8] mb-4">
+              No se pudo revisar si hay un informe reciente ({error}). Podés generar uno nuevo igual.
+            </p>
+          )}
+          {!error && preview && (
+            <p className="text-[13px] text-[#C7D3CE] mb-5 leading-relaxed">
+              El cron automático generó un informe a las <span className="font-mono font-semibold text-[#EDF2F0]">{preview.fechaHoraTexto}</span>.
+              ¿Querés usar ese, o preferís generar uno nuevo ahora (vuelve a consultar Caudal a la DGA, puede tardar)?
+            </p>
+          )}
+
+          <div className="flex flex-col gap-2.5">
+            {!error && preview && (
+              <button
+                onClick={onUsarExistente}
+                className="w-full text-center font-mono text-[13px] font-bold rounded-lg border border-[#3B8FA3]/40 text-[#7ECBDE] py-3 hover:bg-[#3B8FA3]/10 transition-colors"
+              >
+                Usar el informe de las {preview.fechaHoraTexto.split(", ")[1]}
+              </button>
+            )}
+            <button
+              onClick={onGenerarNuevo}
+              className="w-full text-center font-mono text-[13px] font-bold rounded-lg border border-[#2A4038] text-[#DCE7E3] py-3 hover:bg-white/[0.04] transition-colors"
+            >
+              Generar uno nuevo ahora
+            </button>
+          </div>
         </div>
       </div>
     </div>

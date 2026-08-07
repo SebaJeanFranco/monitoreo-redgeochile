@@ -68,6 +68,44 @@ async function obtenerLongitudDocumento(token, documentId) {
   return last ? last.endIndex : 1;
 }
 
+// Lee el texto plano completo del Google Doc — se usa desde el botón
+// "Generar informe" del dashboard para mostrar el último informe
+// automático (escrito por el cron cada 30 min) sin tener que volver a
+// pedir Caudal a la DGA. Reconstruye el texto recorriendo los párrafos
+// del documento y concatenando sus "runs" — la Docs API separa el texto
+// en fragmentos (runs) cuando cambia el estilo (ej. el color por línea que
+// aplica escribirInformeEnDoc), así que hay que unirlos todos para
+// recuperar la línea completa.
+export async function leerInformeDelDoc(env) {
+  const documentId = env.GOOGLE_DOC_ID;
+  if (!documentId) throw new Error("Falta el secret GOOGLE_DOC_ID.");
+
+  const token = await getAccessToken(env);
+
+  const resp = await fetch(`${DOCS_BASE_URL}/${documentId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Google Docs lectura falló (HTTP ${resp.status}): ${text}`);
+  }
+  const data = await resp.json();
+  const content = data.body?.content || [];
+
+  let texto = "";
+  for (const elemento of content) {
+    const parrafo = elemento.paragraph;
+    if (!parrafo) continue;
+    for (const run of parrafo.elements || []) {
+      if (run.textRun?.content) texto += run.textRun.content;
+    }
+  }
+  // Cada párrafo de Doc ya termina en "\n" (Docs lo agrega solo), así que
+  // no hace falta unir con separador — se recorta el "\n" final sobrante
+  // que deja el párrafo vacío de cierre del documento.
+  return texto.replace(/\n+$/, "");
+}
+
 // Reemplaza el contenido completo del documento con `lineas` (mismo array
 // que produce generarInformeTexto().split("\n")), coloreando cada línea
 // según su emoji inicial.

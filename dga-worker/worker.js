@@ -64,7 +64,7 @@
  */
 
 import { appendSnapshotRows, appendLogRows, appendInformeHistoricoRows, readAllSnapshotRows, readInformeHistoricoRows, findLatestPreviousByCode, findLatestPreviousCaudalByCode, historicoPorCodigo, resumenPorCorrida, resumenPorRegionYCorrida } from "./sheets.js";
-import { escribirInformeEnDoc } from "./docs.js";
+import { escribirInformeEnDoc, leerInformeDelDoc } from "./docs.js";
 import { generarInformeTexto } from "./informe.js";
 
 const SNIA_URL = "https://snia.mop.gob.cl/sat/site/informes/mapas/mapas.xhtml";
@@ -664,6 +664,24 @@ async function handleCaudalEstacion(url, env) {
 // Caudal: la hoja "DATOS" nunca guardó esa columna (ver appendSnapshotRows
 // en sheets.js), así que este histórico es solo de Nivel de Agua/umbral.
 // -----------------------------------------------------------------------
+// -----------------------------------------------------------------------
+// Último informe automático — endpoint /informe-actual. Lee el texto ya
+// escrito en el Google Doc (por el cron, cada 30 min) y le extrae la
+// fecha/hora del propio título (ej. "(06-08-2026, 22:48 h)") con un
+// regex, en vez de guardar un timestamp aparte — el título siempre la
+// tiene porque generarInformeTexto() la pone ahí (ver informe.js). Se usa
+// desde el botón "Generar informe" del dashboard: antes de arrancar a
+// pedir Caudal de nuevo, se le muestra al usuario la hora de este informe
+// ya armado para que elija si lo usa tal cual o prefiere generar uno
+// nuevo.
+// -----------------------------------------------------------------------
+async function handleInformeActual(env) {
+  const texto = await leerInformeDelDoc(env);
+  const match = texto.match(/\((\d{2}-\d{2}-\d{4}, \d{2}:\d{2}) h\)/);
+  const fechaHoraTexto = match ? match[1] : null;
+  return { texto, fechaHoraTexto };
+}
+
 async function handleHistoricoEstacion(url, env) {
   const codigo = url.searchParams.get("codigo");
   if (!codigo) {
@@ -901,6 +919,7 @@ export default {
           "/caudal?codigo=XXXXXXX-X&tipoEstacion=Fluviometricas",
           "/historico?codigo=XXXXXXX-X",
           "/resumen",
+          "/informe-actual",
         ],
       });
     }
@@ -935,6 +954,15 @@ export default {
     if (url.pathname === "/resumen") {
       try {
         const data = await handleResumenNacional(env);
+        return jsonResponse(data);
+      } catch (e) {
+        return jsonResponse({ error: e.message || "Error desconocido" }, 502);
+      }
+    }
+
+    if (url.pathname === "/informe-actual") {
+      try {
+        const data = await handleInformeActual(env);
         return jsonResponse(data);
       } catch (e) {
         return jsonResponse({ error: e.message || "Error desconocido" }, 502);
