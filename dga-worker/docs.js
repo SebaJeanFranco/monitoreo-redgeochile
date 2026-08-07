@@ -34,6 +34,7 @@ const COLOR_AMARILLA = hexToRgb01("C98A1B");
 const COLOR_AZUL = hexToRgb01("2E6E8E");
 const COLOR_REGION = hexToRgb01("0F4C3A");
 const COLOR_FUENTE = hexToRgb01("6B7280");
+const COLOR_SECCION = hexToRgb01("1F2937"); // encabezados de sección: 📊 RESUMEN EJECUTIVO, 📈 MAYORES VARIACIONES, 📋 DETALLE
 
 function colorParaLinea(texto) {
   if (texto.startsWith("🔴")) return COLOR_ROJA;
@@ -41,6 +42,7 @@ function colorParaLinea(texto) {
   if (texto.startsWith("🔵")) return COLOR_AZUL;
   if (texto.startsWith("📍")) return COLOR_REGION;
   if (texto.startsWith("Fuente:")) return COLOR_FUENTE;
+  if (texto.startsWith("📊") || texto.startsWith("📈") || texto.startsWith("📋")) return COLOR_SECCION;
   return null;
 }
 
