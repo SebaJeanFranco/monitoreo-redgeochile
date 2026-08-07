@@ -2137,13 +2137,13 @@ function ElegirInformeDialog({ preview, error, onUsarExistente, onGenerarNuevo, 
         <div className="px-6 py-5">
           {error && (
             <p className="text-[13px] text-[#9BAEA8] mb-4">
-              No se pudo revisar si hay un informe reciente ({error}). Podés generar uno nuevo igual.
+              No se pudo revisar si hay un informe reciente ({error}). Puedes generar uno nuevo igual.
             </p>
           )}
           {!error && preview && (
             <p className="text-[13px] text-[#C7D3CE] mb-5 leading-relaxed">
               El cron automático generó un informe a las <span className="font-mono font-semibold text-[#EDF2F0]">{preview.fechaHoraTexto}</span>.
-              ¿Querés usar ese, o preferís generar uno nuevo ahora (vuelve a consultar Caudal a la DGA, puede tardar)?
+              ¿Quieres usar ese, o prefieres generar uno nuevo ahora (vuelve a consultar Caudal a la DGA, puede tardar)?
             </p>
           )}
 
