@@ -159,6 +159,20 @@ function lineasTopVariaciones(topPorRegion) {
 
   const lineas = ["📈 MAYORES VARIACIONES POR REGIÓN (desde la corrida anterior)", ""];
 
+  // Muestra la hora exacta del registro anterior contra el que se
+  // comparó (no cuántos minutos pasaron desde entonces hasta AHORA, sino
+  // la hora de reloj de esa lectura) — así el ranking queda anclado a un
+  // momento concreto, útil para cruzar contra otras fuentes o el propio
+  // histórico en Sheets.
+  function horaDelRegistro(timestampAnterior) {
+    if (!timestampAnterior) return "";
+    const hora = new Date(timestampAnterior).toLocaleString("es-CL", {
+      timeZone: "America/Santiago",
+      hour: "2-digit", minute: "2-digit", hour12: false,
+    });
+    return ` (vs. ${hora} h)`;
+  }
+
   for (const { region, conVariacionAltura, conVariacionCaudal } of topPorRegion) {
     lineas.push(`📍 ${region}`);
 
@@ -166,14 +180,14 @@ function lineasTopVariaciones(topPorRegion) {
       lineas.push("  Altura:");
       for (const s of conVariacionAltura) {
         const flecha = s.tendencia.direccion === "subiendo" ? "↑" : "↓";
-        lineas.push(`    ${flecha} ${Math.abs(s.tendencia.porcentaje)}% — ${tituloLegible(s.nombre)}`);
+        lineas.push(`    ${flecha} ${Math.abs(s.tendencia.porcentaje)}% — ${tituloLegible(s.nombre)}${horaDelRegistro(s.tendencia.timestampAnterior)}`);
       }
     }
     if (conVariacionCaudal.length > 0) {
       lineas.push("  Caudal:");
       for (const s of conVariacionCaudal) {
         const flecha = s.tendenciaCaudal.direccion === "subiendo" ? "↑" : "↓";
-        lineas.push(`    ${flecha} ${Math.abs(s.tendenciaCaudal.porcentaje)}% — ${tituloLegible(s.nombre)}`);
+        lineas.push(`    ${flecha} ${Math.abs(s.tendenciaCaudal.porcentaje)}% — ${tituloLegible(s.nombre)}${horaDelRegistro(s.tendenciaCaudal.timestampAnterior)}`);
       }
     }
     lineas.push("");
